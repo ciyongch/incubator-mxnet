@@ -441,22 +441,12 @@ MXNET_DLL int MXGetGPUCount(int* out);
 
 /*!
  * \brief get the free and total available memory on a GPU
- *  Note: Deprecated, use MXGetGPUMemoryInformation64 instead.
  * \param dev the GPU number to query
  * \param free_mem pointer to the integer holding free GPU memory
  * \param total_mem pointer to the integer holding total GPU memory
  * \return 0 when success, -1 when failure happens
  */
 MXNET_DLL int MXGetGPUMemoryInformation(int dev, int *free_mem, int *total_mem);
-
-/*!
- * \brief get the free and total available memory on a GPU
- * \param dev the GPU number to query
- * \param free_mem pointer to the uint64_t holding free GPU memory
- * \param total_mem pointer to the uint64_t holding total GPU memory
- * \return 0 when success, -1 when failure happens
- */
-MXNET_DLL int MXGetGPUMemoryInformation64(int dev, uint64_t *free_mem, uint64_t *total_mem);
 
 /*!
  * \brief get the MXNet library version as an integer
@@ -1556,13 +1546,12 @@ MXNET_DLL int MXSymbolInferType(SymbolHandle sym,
  * \param num_offline number of parameters that are quantized offline
  * \param offline_params array of c strings representing the names of params quantized offline
  * \param quantized_dtype the quantized destination type for input data.
- * \param calib_quantize whether calibrate quantize op with offline calibration data.
  */
 MXNET_DLL int MXQuantizeSymbol(SymbolHandle sym_handle, SymbolHandle *ret_sym_handle,
                                const mx_uint num_excluded_symbols,
                                const char **excluded_symbols,
                                const mx_uint num_offline, const char **offline_params,
-                               const char *quantized_dtype, const bool calib_quantize);
+                               const char *quantized_dtype);
 
 /*!
  * \brief Set calibration table to node attributes in the sym

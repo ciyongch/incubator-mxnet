@@ -73,11 +73,11 @@ where
 .. Note::
     This operator only supports forward propogation. DO NOT use it in training.)code" ADD_FILELINE)
 .set_attr_parser(ParamParser<QuantizeParam>)
-.set_num_inputs(3)
+.set_num_inputs(1)
 .set_num_outputs(3)
 .set_attr<nnvm::FListInputNames>("FListInputNames",
   [](const NodeAttrs& attrs) {
-    return std::vector<std::string>{"data", "min_range", "max_range"};
+    return std::vector<std::string>{"data"};
   })
 .set_attr<nnvm::FInferShape>("FInferShape", QuantizeShape)
 .set_attr<nnvm::FInferType>("FInferType", QuantizeType)
@@ -87,6 +87,7 @@ where
 .set_attr<FComputeEx>("FComputeEx<cpu>", MKLDNNQuantizeCompute)
 #endif
 .set_attr<FCompute>("FCompute<cpu>", QuantizeCompute<cpu>)
+.set_attr<nnvm::FGradient>("FGradient", MakeZeroGradNodes)
 .add_argument("data", "NDArray-or-Symbol", "A ndarray/symbol of type `float32`")
 .add_argument("min_range", "NDArray-or-Symbol", "The minimum scalar value "
   "possibly produced for the input")

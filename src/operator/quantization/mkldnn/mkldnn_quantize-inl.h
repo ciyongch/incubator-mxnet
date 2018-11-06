@@ -46,13 +46,34 @@ static void MKLDNNQuantizeComputeKer(const std::vector<NDArray>& inputs,
   using red::limits::MinValue;
   float real_range = 0.0;
   float quantized_range = 0.0;
-  if (param.out_type == mshadow::kUint8) {
-    real_range = MaxAbs(*inputs[1].data().dptr<float>(), *inputs[2].data().dptr<float>());
+  NDArray in_buffer = inputs[0];
+  if (inputs[0].IsView() && inputs[0].IsMKLDNNData())
+    in_buffer = inputs[0].Reorder2Default();
+
+  float data_min = red::limits::MaxValue<float>();
+  float data_max = red::limits::MinValue<float>();
+
+  if (param.min_calib_range.has_value() && param.max_calib_range.has_value()) {
+    data_min = param.min_calib_range.value();
+    data_max = param.max_calib_range.value();
+  } else {
+    // no calib info
+    in_buffer = in_buffer.Reorder2Default();
+    auto in_ptr = in_buffer.data().dptr<float>();
+#pragma omp parallel for num_threads(engine::OpenMP::Get()->GetRecommendedOMPThreadCount()) reduction(min:data_min) reduction(max:data_max)
+    for (int64_t i = 0; i < in_buffer.shape().Size(); i++) {
+      if (in_ptr[i] > data_max) data_max = in_ptr[i];
+      if (in_ptr[i] < data_min) data_min = in_ptr[i];
+    }
+  }
+  auto out_type = GetOutputType(param);
+  if (out_type == mshadow::kUint8) {
+    real_range = MaxAbs(data_min, data_max);
     quantized_range = MaxAbs(MaxValue<DstType>(), MinValue<DstType>());
-    *outputs[1].data().dptr<float>() = *inputs[1].data().dptr<float>();
-    *outputs[2].data().dptr<float>() = *inputs[2].data().dptr<float>();
-  } else if (param.out_type == mshadow::kInt8) {
-    real_range = MaxAbs(*inputs[1].data().dptr<float>(), *inputs[2].data().dptr<float>());
+    *outputs[1].data().dptr<float>() = data_min;
+    *outputs[2].data().dptr<float>() = data_max;
+  } else if (out_type == mshadow::kInt8) {
+    real_range = MaxAbs(data_min, data_max);
     quantized_range = MinAbs(MaxValue<DstType>(), MinValue<DstType>());
     *outputs[1].data().dptr<float>() = -real_range;
     *outputs[2].data().dptr<float>() = real_range;
@@ -66,10 +87,6 @@ static void MKLDNNQuantizeComputeKer(const std::vector<NDArray>& inputs,
   attr.set_output_scales(mask, scales);
   attr.set_int_output_round_mode(round_nearest);
   mkldnn::engine cpu_engine = mxnet::CpuEngine::Get()->get_engine();
-
-  NDArray in_buffer = inputs[0];
-  if (inputs[0].IsView() && inputs[0].IsMKLDNNData())
-    in_buffer = inputs[0].Reorder2Default();
 
   auto i_mem = in_buffer.GetMKLDNNData();
   auto i_mpd = i_mem->get_primitive_desc();
@@ -101,9 +118,10 @@ static void MKLDNNQuantizeCompute(const nnvm::NodeAttrs& attrs, const OpContext 
                                   const std::vector<OpReqType> &req,
                                   const std::vector<NDArray> &outputs) {
   const QuantizeParam& param = nnvm::get<QuantizeParam>(attrs.parsed);
-  if (param.out_type == mshadow::kUint8) {
+  auto out_type = GetOutputType(param);
+  if (out_type == mshadow::kUint8) {
     MKLDNNQuantizeComputeKer<float, uint8_t>(inputs, outputs, param, req);
-  } else if (param.out_type == mshadow::kInt8) {
+  } else if (out_type == mshadow::kInt8) {
     MKLDNNQuantizeComputeKer<float, int8_t>(inputs, outputs, param, req);
   } else {
     LOG(FATAL) << "mkldnn quantize op only supports int8 and uint8 as output type";
