@@ -35,7 +35,7 @@ from ..symbol import load as sym_load
 from .. import ndarray
 from ..ndarray import load as nd_load
 from ..ndarray import NDArray
-from ..io import DataIter
+from ..io import DataIter, DataBatch
 from ..context import cpu, Context
 from ..module import Module
 
@@ -207,21 +207,27 @@ def _calibrate_quantized_sym(qsym, th_dict):
 
 
 def _collect_layer_statistics(mod, data, collector, max_num_examples=None, logger=None):
-    if not isinstance(data, DataIter):
+    if not isinstance(data, DataIter) and not isinstance(data, DataBatch):
         raise ValueError('Only supports data as a type of DataIter, while received type %s'
                          % str(type(data)))
     mod._exec_group.execs[0].set_monitor_callback(collector.collect)
     num_batches = 0
     num_examples = 0
-    for batch in data:
-        mod.forward(data_batch=batch, is_train=False)
-        num_batches += 1
-        num_examples += data.batch_size
-        if max_num_examples is not None and num_examples >= max_num_examples:
-            break
-    if logger is not None:
-        logger.info("Collected statistics from %d batches with batch_size=%d"
-                    % (num_batches, data.batch_size))
+
+    if isinstance(data, DataBatch):
+        mod.forward(data_batch=data, is_train=False)
+        if logger is not None:
+            logger.info("Collected statistics for DataBatch...")
+    else:
+        for batch in data:
+            mod.forward(data_batch=batch, is_train=False)
+            num_batches += 1
+            num_examples += data.batch_size
+            if max_num_examples is not None and num_examples >= max_num_examples:
+                break
+        if logger is not None:
+            logger.info("Collected statistics from %d batches with batch_size=%d"
+                        % (num_batches, data.batch_size))
     return num_examples
 
 
