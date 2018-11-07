@@ -61,8 +61,6 @@ def _quantize_params(qsym, params):
             original_name = name[:-len('_quantize')]
             param = params[original_name]
             val, vmin, vmax = ndarray.contrib.quantize(data=param,
-                                                       min_range=ndarray.min(param),
-                                                       max_range=ndarray.max(param),
                                                        out_type='int8')
             quantized_params[name] = val
             quantized_params[name+'_min'] = vmin

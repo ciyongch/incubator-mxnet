@@ -340,11 +340,13 @@ Graph SetCalibTableToQuantizedGraph(Graph&& g) {
     nnvm::Op::GetAttr<mxnet::FNeedRequantize>("FNeedRequantize");
   const auto& calib_table =
     g.GetAttr<std::unordered_map<std::string, std::pair<float, float>>>("calib_table");
+
   DFSVisit(g.outputs, [&](const NodePtr& node) {
     // If the current op is requantize
     // find the thresholds from the calibration table with the key equal
     // to the current op's input node name, e.g. a quantized_conv2d node.
-    if (node->op() != nullptr && node->op()->name == "_contrib_requantize") {
+    if (node->op() == nullptr) return;
+    if (node->op()->name == "_contrib_requantize") {
       NodePtr quantized_op_node = node->inputs[0].node;
       CHECK(quantized_op_node->op() != nullptr) << quantized_op_node->attrs.name
                                                 << " must be an quantized op node";
