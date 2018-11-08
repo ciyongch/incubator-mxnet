@@ -54,6 +54,22 @@ struct RequantizeParam : public dmlc::Parameter<RequantizeParam> {
   }
 };
 
+inline bool ReQuantizeShape(const nnvm::NodeAttrs& attrs,
+                            std::vector<TShape> *in_attrs,
+                            std::vector<TShape> *out_attrs) {
+  CHECK_EQ(in_attrs->size(), 3U);
+  CHECK_EQ(out_attrs->size(), 3U);
+
+  for (size_t i = 1; i < 3; ++i) {
+    SHAPE_ASSIGN_CHECK(*in_attrs, i, TShape({1}));
+  }
+
+  SHAPE_ASSIGN_CHECK(*out_attrs, 0, in_attrs->at(0));
+  SHAPE_ASSIGN_CHECK(*out_attrs, 1, TShape{1});
+  SHAPE_ASSIGN_CHECK(*out_attrs, 2, TShape{1});
+  return !shape_is_none(out_attrs->at(0));
+}
+
 inline bool RequantizeType(const nnvm::NodeAttrs& attrs,
                            std::vector<int> *in_attrs,
                            std::vector<int> *out_attrs) {
