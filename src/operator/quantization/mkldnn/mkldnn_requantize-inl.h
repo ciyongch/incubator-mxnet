@@ -111,6 +111,22 @@ static void MKLDNNRequantizeForward(const nnvm::NodeAttrs& attrs,
     MKLDNNRequantizeForwardKer(attrs, ctx, inputs, req, outputs, real_range);
   // Model is not calibrated
   } else {
+    float data_min = red::limits::MaxValue<float>();
+    float data_max = red::limits::MinValue<float>();
+
+    NDArray in_buffer = inputs[0];
+    if (inputs[0].IsView() && inputs[0].IsMKLDNNData())
+      in_buffer = inputs[0].Reorder2Default();
+
+    in_buffer = in_buffer.Reorder2Default();
+    auto in_ptr = in_buffer.data().dptr<float>();
+#pragma omp parallel for num_threads(engine::OpenMP::Get()->GetRecommendedOMPThreadCount()) reduction(min:data_min) reduction(max:data_max)
+    for (int64_t i = 0; i < in_buffer.shape().Size(); i++) {
+      if (in_ptr[i] > data_max) data_max = in_ptr[i];
+      if (in_ptr[i] < data_min) data_min = in_ptr[i];
+    }
+    real_range = MaxAbs(data_min, data_max);
+    /*
     TShape src_shape, dst_shape;
     const size_t actual_float_size = sizeof(float);
     const size_t actual_quantized_size = sizeof(SrcDType);
@@ -147,6 +163,7 @@ static void MKLDNNRequantizeForward(const nnvm::NodeAttrs& attrs,
         inputs[2].Reorder2Default().data().dptr<float>());
 
     real_range = MaxAbs(*actual_min_float.dptr_, *actual_max_float.dptr_);
+    */
     MKLDNNRequantizeForwardKer(attrs, ctx, inputs, req, outputs, real_range);
   }
 }
