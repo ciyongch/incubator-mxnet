@@ -68,8 +68,7 @@ std::vector<NodeEntry> OfflineParams(std::vector<NodeEntry>&& outputs,
   std::unordered_map<Node*, NodePtr> mirror_map;
   nnvm::NodeEntryMap<NodePtr> entry_var;
   auto need_offline = [&](NodePtr n) {
-    return n->op() &&
-           (n->op()->name == "_contrib_quantize") &&
+    return (n->op() == Op::Get("_contrib_quantize")) &&
            n->inputs[0].node->is_variable() &&
            offline_params.count(n->inputs[0].node->attrs.name);
   };
@@ -194,8 +193,7 @@ Graph QuantizeGraph(Graph &&src) {
             }
             mirror_entry_map[e] = NodeEntry{quantize_node, 0, e.version};
           }
-        } else if (mirror_node->op() != nullptr
-                   && mirror_node->op()->name == "_contrib_dequantize") {
+        } else if (mirror_node->op() == Op::Get("_contrib_dequantize")) {
           new_node->inputs.emplace_back(NodeEntry{mirror_node->inputs[0].node, e.index, e.version});
         } else {
           // If the entry e's node needs quantization, or mirror_entry is from a quantize op,
@@ -210,8 +208,7 @@ Graph QuantizeGraph(Graph &&src) {
       for (size_t i = 0; i < node->inputs.size(); ++i) {
         const auto& e = node->inputs[i];
         NodePtr mirror_node = mirror_map.at(e.node.get());
-        if (mirror_node->op() != nullptr
-            && mirror_node->op()->name == "_contrib_dequantize") {
+        if (mirror_node->op() == Op::Get("_contrib_dequantize")) {
           mirror_node = mirror_node->inputs[0].node;
         }
         NodeEntry mirror_entry = NodeEntry{
@@ -284,8 +281,7 @@ Graph QuantizeGraph(Graph &&src) {
             mirror_node, e.index, e.version};
           // if input node is quantized operator, add dequantize node
           if (NeedQuantize(e.node, excluded_nodes) &&
-              (mirror_node->op() != nullptr &&
-              mirror_node->op()->name != "_contrib_dequantize")) {
+              (mirror_node->op() != Op::Get("_contrib_dequantize"))) {
             // here we calculate the output number (exclude min/max, in order to
             // calculate min/max index from mirror node) based on assumption that
             // there is only 1min and 1max output from mirror node (which is
@@ -356,8 +352,7 @@ Graph SetCalibTableToQuantizedGraph(Graph&& g) {
     // If the current op is requantize
     // find the thresholds from the calibration table with the key equal
     // to the current op's input node name, e.g. a quantized_conv2d node.
-    if (node->op() == nullptr) return;
-    if (node->op()->name == "_contrib_requantize") {
+    if (node->op() == Op::Get("_contrib_requantize")) {
       NodePtr quantized_op_node = node->inputs[0].node;
       CHECK(quantized_op_node->op() != nullptr) << quantized_op_node->attrs.name
                                                 << " must be an quantized op node";
