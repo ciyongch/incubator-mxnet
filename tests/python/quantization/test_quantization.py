@@ -44,7 +44,7 @@ def test_quantize_float32_to_int8():
     data = rand_ndarray(shape, 'default', dtype='float32')
     min_range = mx.nd.min(data)
     max_range = mx.nd.max(data)
-    qdata, min_val, max_val = mx.nd.contrib.quantize(data, min_range, max_range, out_type='int8')
+    qdata, min_val, max_val = mx.nd.contrib.quantize(data, out_type='int8')
     data_np = data.asnumpy()
     min_range = min_range.asscalar()
     max_range = max_range.asscalar()
@@ -374,7 +374,7 @@ def test_quantize_params():
     for name in offline_params:
         params[name] = mx.nd.uniform(shape=(2, 2))
     qsym = mx.contrib.quant._quantize_symbol(sym, offline_params=offline_params)
-    qparams = mx.contrib.quant._quantize_params(qsym, params, th_dict = {})
+    qparams = mx.contrib.quant._quantize_params(qsym, params)
     param_names = params.keys()
     qparam_names = qparams.keys()
     for name in qparam_names:
@@ -433,7 +433,7 @@ def test_quantize_model():
                     assert k in qparams
                     assert same(v.asnumpy(), qparams[k].asnumpy())
             else:
-                qparams_ground_truth = mx.contrib.quant._quantize_params(qsym, params, th_dict = {})
+                qparams_ground_truth = mx.contrib.quant._quantize_params(qsym, params)
                 assert len(qparams) == len(qparams_ground_truth)
                 for k, v in qparams_ground_truth.items():
                     assert k in qparams
@@ -517,7 +517,7 @@ def test_quantize_model_with_forward():
                     assert k in qparams
                     assert same(v.asnumpy(), qparams[k].asnumpy())
             else:
-                qparams_ground_truth = mx.contrib.quant._quantize_params(qsym, params, th_dict = {})
+                qparams_ground_truth = mx.contrib.quant._quantize_params(qsym, params)
                 assert len(qparams) == len(qparams_ground_truth)
                 for k, v in qparams_ground_truth.items():
                     assert k in qparams

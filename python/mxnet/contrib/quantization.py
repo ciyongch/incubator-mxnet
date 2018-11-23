@@ -422,7 +422,7 @@ def quantize_model(sym, arg_params, aux_params,
                    data_names=('data',), label_names=('softmax_label',),
                    ctx=cpu(), excluded_sym_names=None, calib_mode='entropy',
                    calib_data=None, num_calib_examples=None, calib_layer=None,
-                   quantized_dtype='int8', calib_quantize_op=False, logger=logging):
+                   quantized_dtype='int8', logger=logging):
     """User-level API for generating a quantized model from a FP32 model w/ or w/o calibration.
     The backend quantized operators are only enabled for Linux systems. Please do not run
     inference using the quantized models on Windows for now.
@@ -476,8 +476,6 @@ def quantize_model(sym, arg_params, aux_params,
         The quantized destination type for input data. Currently support 'int8'
         , 'uint8' and 'auto'. 'auto' means automatically select output type according to calibration result.
         Default value is 'int8'.
-    calib_quantize_op: bool
-        Whether calibrate quantize op with its input calibration data. The quantize op's input should be in calib_layer
     logger : Object
         A logging object for printing information during the process of quantization.
 
@@ -500,8 +498,7 @@ def quantize_model(sym, arg_params, aux_params,
                          ' expected `int8`, `uint8` or `auto`' % quantized_dtype)
     qsym = _quantize_symbol(sym, excluded_symbols=excluded_sym_names,
                             offline_params=list(arg_params.keys()),
-                            quantized_dtype=quantized_dtype,
-                            calib_quantize_op=calib_quantize_op)
+                            quantized_dtype=quantized_dtype)
 
     th_dict = {}
     if calib_mode is not None and calib_mode != 'none':
@@ -541,6 +538,6 @@ def quantize_model(sym, arg_params, aux_params,
         qsym = _calibrate_quantized_sym(qsym, th_dict)
 
     logger.info('Quantizing parameters')
-    qarg_params = _quantize_params(qsym, arg_params, th_dict)
+    qarg_params = _quantize_params(qsym, arg_params)
 
     return qsym, qarg_params, aux_params
