@@ -30,6 +30,12 @@
 namespace mxnet {
 namespace op {
 
+bool SupportMKLDNNSum(const NDArray& input) {
+  int ndim = input.shape().ndim();
+  return input.dtype() == mshadow::kFloat32 && (ndim >= 1 && ndim <= 4) &&
+         input.storage_type() == kDefaultStorage;
+}
+
 static void ElemwiseAddEx(const nnvm::NodeAttrs& attrs,
                           const OpContext& ctx,
                           const std::vector<NDArray>& inputs,
@@ -38,7 +44,7 @@ static void ElemwiseAddEx(const nnvm::NodeAttrs& attrs,
   CHECK_EQ(inputs.size(), 2U);
   CHECK_EQ(outputs.size(), 1U);
 #if MXNET_USE_MKLDNN == 1
-  if (SupportMKLDNN(inputs[0]) && SupportMKLDNN(inputs[1])) {
+  if (SupportMKLDNNSum(inputs[0]) && SupportMKLDNNSum(inputs[1])) {
     MKLDNNSumForward(attrs, ctx, inputs, req[0], outputs[0]);
     return;
   } else if (inputs[0].storage_type() == kDefaultStorage
@@ -200,6 +206,132 @@ NNVM_REGISTER_OP(_backward_sub)
 .set_attr<FInferStorageType>("FInferStorageType",
                              ElemwiseStorageType<1, 2, true, true, true>);
 
+#if MSHADOW_USE_MKL == 1
+static inline void MKLMul(MKL_INT n, const float* a, const float* b, float* y) {
+  vsMul(n, a, b, y);
+}
+
+static inline void MKLMul(MKL_INT n, const double* a, const double* b, double* y) {
+  vdMul(n, a, b, y);
+}
+#endif
+
+static void OptimalMul(const nnvm::NodeAttrs& attrs,
+                       const OpContext& ctx,
+                       const std::vector<TBlob>& inputs,
+                       const std::vector<OpReqType>& req,
+                       const std::vector<TBlob>& outputs) {
+#if MSHADOW_USE_MKL == 1
+  auto type_flag = inputs[0].type_flag_;
+  const auto MKL_INT_MAX = (sizeof(MKL_INT) == sizeof(int)) ? INT_MAX : LLONG_MAX;
+  auto input0_size = inputs[0].Size();
+  auto input1_size = inputs[1].Size();
+  CHECK_EQ(input0_size, input1_size) << "OptimalMul requires the two inputs with the same size!";
+  if (input0_size <= MKL_INT_MAX &&
+      (type_flag == mshadow::kFloat32 || type_flag == mshadow::kFloat64)) {
+      MSHADOW_SGL_DBL_TYPE_SWITCH(type_flag, DType, {
+        MKLMul(input0_size,
+               inputs[0].dptr<DType>(),
+               inputs[1].dptr<DType>(),
+               outputs[0].dptr<DType>());
+      });
+  } else {
+    ElemwiseBinaryOp::Compute<cpu, op::mshadow_op::mul>(attrs, ctx, inputs, req, outputs);
+  }
+#else
+    ElemwiseBinaryOp::Compute<cpu, op::mshadow_op::mul>(attrs, ctx, inputs, req, outputs);
+#endif
+}
+
+static inline bool ElemwiseMulStorageType(const nnvm::NodeAttrs& attrs,
+                                          const int dev_mask,
+                                          DispatchMode* dispatch_mode,
+                                          std::vector<int> *in_attrs,
+                                          std::vector<int> *out_attrs) {
+  CHECK_EQ(in_attrs->size(), 2);
+  CHECK_EQ(out_attrs->size(), 1);
+  bool ret = ElemwiseBinaryOp::PreferSparseStorageType(
+               attrs, dev_mask, dispatch_mode, in_attrs, out_attrs);
+#if MXNET_USE_MKLDNN == 1
+  if (dev_mask == mshadow::cpu::kDevMask && !MKLDNNEnvSet()) {
+    *dispatch_mode = DispatchMode::kFComputeFallback;
+  } else if (dev_mask == mshadow::cpu::kDevMask
+      && common::ContainsOnlyStorage(*in_attrs, kDefaultStorage)
+      && out_attrs->at(0) == kDefaultStorage) {
+    *dispatch_mode = DispatchMode::kFComputeEx;
+  }
+#endif
+  return ret;
+}
+
+static void ElemwiseMulEx(const nnvm::NodeAttrs& attrs,
+                          const OpContext& ctx,
+                          const std::vector<NDArray>& inputs,
+                          const std::vector<OpReqType>& req,
+                          const std::vector<NDArray>& outputs) {
+  auto num_inputs = inputs.size();
+  CHECK_EQ(num_inputs, 2U);
+  CHECK_EQ(outputs.size(), 1U);
+
+#if MXNET_USE_MKLDNN == 1 && MSHADOW_USE_MKL == 1
+  size_t num_elem = inputs[0].shape().Size();
+  std::vector<mkldnn::memory::primitive_desc> data_md;
+  std::vector<const mkldnn::memory *> data_mem;
+  data_md.reserve(num_inputs);
+  data_mem.reserve(num_inputs);
+  float *input0_data_ptr = nullptr;
+  float *input1_data_ptr = nullptr;
+
+  if (inputs[0].dtype() == mshadow::kFloat32) {
+    if (inputs[0].IsMKLDNNData() && inputs[1].IsMKLDNNData()) {
+      for (size_t i = 0; i < num_inputs; ++i) {
+        const mkldnn::memory *tmp_mem = inputs[i].GetMKLDNNData();
+        mkldnn::memory::primitive_desc tmp_pd = tmp_mem->get_primitive_desc();
+        data_mem.push_back(tmp_mem);
+        data_md.push_back(tmp_pd);
+      }
+
+      if (data_md[0] == data_md[1]) {
+        input0_data_ptr = reinterpret_cast<float *>(data_mem[0]->get_data_handle());
+        input1_data_ptr = reinterpret_cast<float *>(data_mem[1]->get_data_handle());
+      } else {
+        //inputs0 has different format vs inputs1, conver inputs1 to inputs0's format
+        const mkldnn::memory *input1_mem = inputs[1].GetMKLDNNDataReorder(data_md[0]);
+        input0_data_ptr = reinterpret_cast<float *>(data_mem[0]->get_data_handle());
+        input1_data_ptr = reinterpret_cast<float *>(input1_mem->get_data_handle());
+      }
+    } else if (inputs[0].IsMKLDNNData()) {
+      //inputs0 is MKLDNN Data, while inputs1 is Default Data
+      NDArray arr = inputs[0].Reorder2Default();
+      input0_data_ptr = arr.data().dptr<float>();
+      input1_data_ptr = inputs[1].data().dptr<float>();
+    } else if (inputs[1].IsMKLDNNData()) {
+      //inputs0 is Default Data, while inputs1 is MKLDNN Data
+      NDArray arr = inputs[1].Reorder2Default();
+      input0_data_ptr = inputs[0].data().dptr<float>();
+      input1_data_ptr = arr.data().dptr<float>();
+    } else {
+      //both inputs0 and inputs1 are Default Data
+      input0_data_ptr = inputs[0].data().dptr<float>();
+      input1_data_ptr = inputs[1].data().dptr<float>();
+    }
+
+    auto *output_data_ptr = reinterpret_cast<float*>(outputs[0].IsMKLDNNData() ?
+        outputs[0].GetMKLDNNData()->get_data_handle() : outputs[0].data().dptr<float>());
+    MKLMul(num_elem,
+           input0_data_ptr,
+           input1_data_ptr,
+           output_data_ptr);
+
+  } else {
+    FallBackCompute(OptimalMul, attrs, ctx, inputs, req, outputs);
+    return;
+  }
+#else
+    FallBackCompute(OptimalMul, attrs, ctx, inputs, req, outputs);
+#endif
+}
+
 MXNET_OPERATOR_REGISTER_BINARY(elemwise_mul)
 MXNET_ADD_SPARSE_OP_ALIAS(elemwise_mul)
 .describe(R"code(Multiplies arguments element-wise.
@@ -214,11 +346,16 @@ The storage type of ``elemwise_mul`` output depends on storage types of inputs
    - otherwise, ``elemwise_mul`` generates output with default storage
 
 )code")
-.set_attr<FInferStorageType>("FInferStorageType",
-                             ElemwiseBinaryOp::PreferSparseStorageType)
+.set_attr<FInferStorageType>("FInferStorageType", ElemwiseMulStorageType)
+#if MSHADOW_USE_MKL == 1
+.set_attr<FCompute>("FCompute<cpu>", OptimalMul)
+#else
 .set_attr<FCompute>("FCompute<cpu>", ElemwiseBinaryOp::Compute<cpu, op::mshadow_op::mul>)
-.set_attr<FComputeEx>("FComputeEx<cpu>",
-                      ElemwiseBinaryOp::ComputeDnsLRValueEx<cpu, op::mshadow_op::mul, true, true>)
+#endif
+#if MXNET_USE_MKLDNN == 1
+.set_attr<bool>("TIsMKLDNN", true)
+#endif
+.set_attr<FComputeEx>("FComputeEx<cpu>", ElemwiseMulEx)
 .set_attr<FResourceRequest>("FResourceRequest",  /* For Sparse CSR */
                               [](const NodeAttrs& attrs) {
                                 return std::vector<ResourceRequest>{ResourceRequest::kTempSpace};
