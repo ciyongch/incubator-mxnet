@@ -422,6 +422,12 @@ will return a new array with shape ``(2,1,3,4)``.
 .add_argument("data", "NDArray-or-Symbol", "Source input")
 .add_arguments(ExpandDimParam::__FIELDS__());
 
+bool SupportMKLDNNSlice(const NDArray& input) {
+  int ndim = input.shape().ndim();
+  return input.dtype() == mshadow::kFloat32 && (ndim >= 1 && ndim <= 4) &&
+         input.storage_type() == kDefaultStorage;
+}
+
 void SliceExCPU(const nnvm::NodeAttrs& attrs,
                 const OpContext& ctx,
                 const std::vector<NDArray>& inputs,
@@ -435,7 +441,7 @@ void SliceExCPU(const nnvm::NodeAttrs& attrs,
     SliceCsrImpl<cpu>(param, ctx, inputs[0], req[0], outputs[0]);
 #if MXNET_USE_MKLDNN == 1
   } else if (in_stype == kDefaultStorage) {
-    if (SupportMKLDNN(inputs[0])) {
+    if (SupportMKLDNNSlice(inputs[0])) {
       MKLDNNSlice(param, ctx, inputs[0], req[0], outputs[0]);
     } else {
       FallBackCompute(SliceOpForward<cpu>, attrs, ctx, inputs, req, outputs);
