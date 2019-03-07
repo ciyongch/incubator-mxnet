@@ -169,10 +169,12 @@ class SgMKLDNNConvOperator {
       : subgraph_sym_(*attrs.subgraphs[0]),
         param_(nnvm::get<MKLDNNConvFusionParam>(attrs.parsed)) {}
 
-  void Forward(const OpContext &ctx,
-               const std::vector<NDArray> &inputs,
-               const std::vector<OpReqType> &req,
-               const std::vector<NDArray> &outputs);
+  void StaticForward();
+
+  void Forward(const OpContext &ctx, const std::vector<NDArray> &inputs,
+               const std::vector<OpReqType> &req, const std::vector<NDArray> &outputs);
+
+  bool IsStatic() { return static_; };
 
  private:
   bool initalized_{false};
@@ -193,7 +195,22 @@ class SgMKLDNNConvOperator {
   size_t bias_ver_;
   float data_scale_{0.0f};
   std::vector<float> weight_scales_;
+  bool static_{false};
+  std::shared_ptr<mkldnn::reorder> static_data_reorder_;
+  std::shared_ptr<MKLDNNMemory> static_data_mkldnn_mem_;
+  std::shared_ptr<MKLDNNMemory> static_out_mkldnn_mem_;
+  NDArray static_output_;
 };
+
+void SgMKLDNNConvOperator::StaticForward() {
+  const auto &stream = MKLDNNStream::Get();
+  if (static_data_reorder_) {
+  stream->RegisterPrim(*static_data_reorder_);
+  }
+  stream->RegisterPrim(fwd_->GetFwd());
+  stream->Submit();
+  static_output_.UpdateMKLDNNMem(static_out_mkldnn_mem_);
+}
 
 void SgMKLDNNConvOperator::Forward(const OpContext &ctx,
                                    const std::vector<NDArray> &inputs,
@@ -350,31 +367,52 @@ void SgMKLDNNConvOperator::Forward(const OpContext &ctx,
         has_bias ? &cached_bias_ : nullptr, output));
     ConvertWeightBias2MKLDNN(full_conv_param, fwd_->fwd_pd, &cached_weight_, &cached_bias_,
                              has_bias, data_scale_, weight_scales_);
-    fwd_->SetNewMem(*data.GetMKLDNNData(), *cached_weight_.GetMKLDNNData(),
-                    has_bias ? cached_bias_.GetMKLDNNData() : nullptr,
-                    *output.GetMKLDNNData());
     initalized_ = true;
+    static_ = dmlc::GetEnv("MXNET_STATIC_GRAPH", 0);
+    if (static_) {
+      static_output_ = outputs[kOut];
+      const mkldnn::memory *mem = output.GetMKLDNNData();
+      const auto mem_desc = mem->get_primitive_desc().desc();
+      const auto this_dtype = get_mkldnn_type(outputs[kOut].dtype());
+      const auto format =
+          static_cast<mkldnn::memory::format>(fwd_->fwd_pd.dst_primitive_desc().desc().data.format);
+      mkldnn::memory::desc data_md(
+          mkldnn::memory::dims(mem_desc.data.dims, mem_desc.data.dims + mem_desc.data.ndims),
+          this_dtype, format);
+      mkldnn::memory::primitive_desc pd(data_md, CpuEngine::Get()->get_engine());
+      static_out_mkldnn_mem_ = std::make_shared<MKLDNNMemory>(pd, mem->get_data_handle());
+      if (fwd_->fwd_pd.src_primitive_desc() != data.GetMKLDNNData()->get_primitive_desc()) {
+        static_data_mkldnn_mem_ = std::make_shared<MKLDNNMemory>(fwd_->fwd_pd.src_primitive_desc());
+        static_data_reorder_ =
+            std::make_shared<mkldnn::reorder>(*data.GetMKLDNNData(), *static_data_mkldnn_mem_->GetMem());
+        fwd_->SetNewMem(*static_data_mkldnn_mem_->GetMem(), *cached_weight_.GetMKLDNNData(),
+                        has_bias ? cached_bias_.GetMKLDNNData() : nullptr,
+                        *static_out_mkldnn_mem_->GetMem());
+      } else {
+        fwd_->SetNewMem(*data.GetMKLDNNData(), *cached_weight_.GetMKLDNNData(),
+                        has_bias ? cached_bias_.GetMKLDNNData() : nullptr,
+                        *static_out_mkldnn_mem_->GetMem());
+      }
+    if (post_requantize_) {
+      *outputs[kMin].data().dptr<float>() = cached_output_min_;
+      *outputs[kMax].data().dptr<float>() = cached_output_max_;
+    }
+    StaticForward();
+    return;
+    }
   }
 
-  if (mkldnn_param.quantized) {
-    auto data_mem = data.GetMKLDNNDataReorder(fwd_->fwd_pd.src_primitive_desc());
-    mkldnn::memory *mem = output.CreateMKLDNNData(fwd_->fwd_pd.dst_primitive_desc());
-    fwd_->SetNewMem(*data_mem, *mem);
-    MKLDNNStream::Get()->RegisterPrim(fwd_->GetFwd());
-    MKLDNNStream::Get()->Submit();
+  std::vector<NDArray> new_inputs;
+  std::vector<OpReqType> new_req;
+  if (has_bias) {
+    new_inputs = {data, cached_weight_, cached_bias_};
+    new_req = {req[in_data], req[in_weight], req[in_bias]};
   } else {
-    std::vector<NDArray> new_inputs;
-    std::vector<OpReqType> new_req;
-    if (has_bias) {
-      new_inputs = {data, cached_weight_, cached_bias_};
-      new_req = {req[in_data], req[in_weight], req[in_bias]};
-    } else {
-      new_inputs = {data, cached_weight_};
-      new_req = {req[in_data], req[in_weight]};
-    }
-    MKLDNNConvolutionForwardFullFeature(full_conv_param, ctx, fwd_.get(), new_inputs, new_req,
-                                        {output});
+    new_inputs = {data, cached_weight_};
+    new_req = {req[in_data], req[in_weight]};
   }
+  MKLDNNConvolutionForwardFullFeature(full_conv_param, ctx, fwd_.get(), new_inputs, new_req,
+                                      {output});
   if (post_requantize_) {
   float *out_min_ptr = outputs[kMin].data().dptr<float>();
   float *out_max_ptr = outputs[kMax].data().dptr<float>();
@@ -383,8 +421,8 @@ void SgMKLDNNConvOperator::Forward(const OpContext &ctx,
   }
   if (mkldnn_param.with_sum) {
     auto out = const_cast<NDArray &>(outputs[kOut]);
-    auto format = static_cast<mkldnn::memory::format>(
-        fwd_->fwd_pd.dst_primitive_desc().desc().data.format);
+    auto format =
+        static_cast<mkldnn::memory::format>(fwd_->fwd_pd.dst_primitive_desc().desc().data.format);
     out.UpdateMKLDNNMemDesc(format);
   }
 }
@@ -395,7 +433,11 @@ static void SgMKLDNNConvOpForward(const OpStatePtr &state_ptr,
                                   const std::vector<OpReqType> &req,
                                   const std::vector<NDArray> &outputs) {
   SgMKLDNNConvOperator &op = state_ptr.get_state<SgMKLDNNConvOperator>();
-  op.Forward(ctx, inputs, req, outputs);
+  if (op.IsStatic()) {
+    op.StaticForward();
+  } else {
+    op.Forward(ctx, inputs, req, outputs);
+  }
 }
 
 static uint32_t SgMKLDNNConvNumInputs(const NodeAttrs &attrs) {

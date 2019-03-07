@@ -733,6 +733,11 @@ void NDArray::UpdateMKLDNNMemDesc(mkldnn::memory::format format) {
   ptr_->mkl_mem_.reset(new MKLDNNMemory(pd, ptr_->shandle.dptr));
   MKLDNNStream::Get()->RegisterMem(ptr_->mkl_mem_->GetMem());
 }
+
+void NDArray::UpdateMKLDNNMem(const std::shared_ptr<MKLDNNMemory> &mem) {
+  ptr_->mkl_mem_ = mem;
+  ptr_->mkl_mem_->SetDataHandle(ptr_->shandle.dptr);
+}
 #endif
 
 void NDArray::SetTBlob() const {

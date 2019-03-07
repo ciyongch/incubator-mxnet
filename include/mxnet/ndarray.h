@@ -781,6 +781,8 @@ class NDArray {
    * \ Fix mkldnn memory descriptor mismatch from NDArray.
    */
   void UpdateMKLDNNMemDesc(mkldnn::memory::format format);
+
+  void UpdateMKLDNNMem(const std::shared_ptr<MKLDNNMemory> &mem);
 #endif
 
   /*!
