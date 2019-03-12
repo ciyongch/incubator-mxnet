@@ -50,8 +50,11 @@ MKLDNNSliceFwd::MKLDNNSliceFwd(const SliceParam &param,
     offsets[i] = s;
   }
   auto in_mem_pd = in.GetMKLDNNData()->get_primitive_desc();
-  auto out_mem_pd = out.GetMKLDNNData()->get_primitive_desc();
+  //TODO(ciyong), add check for internal format with slice on packed dimension
+  auto format = in_mem_pd.desc().data.format;
+  auto out_mem_pd = GetPrimitiveDesc(out.GetMKLDNNData()->get_primitive_desc(), format);
   auto view_pd = mkldnn::view::primitive_desc(in_mem_pd, dims, offsets);
+
   auto reorder_pd = reorder::primitive_desc(view_pd.dst_primitive_desc(), out_mem_pd);
   this->data_ = std::make_shared<mkldnn::memory>(view_pd.dst_primitive_desc(), nullptr);
   this->out_ = std::make_shared<mkldnn::memory>(view_pd.dst_primitive_desc(), nullptr);
@@ -91,7 +94,11 @@ void MKLDNNSlice(const SliceParam &param, const OpContext& ctx,
                  const NDArray &in, OpReqType req, const NDArray &out) {
   MKLDNNSliceFwd &fwd = GetSliceForward(param, ctx.is_train, in, out);
   auto in_mem = in.GetMKLDNNData();
-  auto out_mem_pd = out.GetMKLDNNData()->get_primitive_desc();
+
+  //TODO(ciyong), add check for internal format with slice on packed dimension
+  auto format = in_mem->get_primitive_desc().desc().data.format;
+  auto out_mem_pd = GetPrimitiveDesc(out.GetMKLDNNData()->get_primitive_desc(), format);
+
   auto out_mem = CreateMKLDNNMem(out, out_mem_pd, req);
   fwd.SetNewMem(*in_mem, *out_mem.second);
   MKLDNNStream::Get()->RegisterPrim(fwd.GetPd());
