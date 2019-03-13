@@ -589,14 +589,10 @@ void CachedOp::StaticInitExec(
       if (skip) continue;
       SetupOpExec(g, i, state.execs[i], state.arrays, state.array_reqs);
     }
-
-    size_t bulk_size = idx.num_nodes();
-    if (recording || keep_fwd) {
-      bulk_size = keep_fwd ? config_.backward_bulk_size : config_.forward_bulk_size;
-    }
-
-    CreateEngineOpSeg(idx, default_ctx, start_nid, end_nid, bulk_size,
-                      state.execs, skip_plus_node, &state.opr_segs);
+    size_t bulk_size =
+        (recording || keep_fwd) ? config_.backward_bulk_size : config_.forward_bulk_size;
+    CreateEngineOpSeg(idx, default_ctx, start_nid, end_nid, bulk_size, state.execs, skip_plus_node,
+                      &state.opr_segs);
   }
 
   if (keep_fwd) {
