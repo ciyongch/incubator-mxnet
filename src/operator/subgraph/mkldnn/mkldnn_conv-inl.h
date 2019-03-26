@@ -21,11 +21,12 @@
 #define MXNET_OPERATOR_SUBGRAPH_MKLDNN_MKLDNN_CONV_INL_H_
 #if MXNET_USE_MKLDNN == 1
 
+#include <string>
 #include <utility>
 #include <vector>
-#include <string>
-#include "../../nn/convolution-inl.h"
+#include "../../nn/activation-inl.h"
 #include "../../nn/batch_norm-inl.h"
+#include "../../nn/convolution-inl.h"
 #include "../../nn/mkldnn/mkldnn_convolution-inl.h"
 
 namespace mxnet {
@@ -34,7 +35,25 @@ namespace op {
 struct MKLDNNConvFusionParam {
   MKLDNNConvFullParam full_conv_param;
   std::shared_ptr<BatchNormParam> bn_param;
+  std::shared_ptr<ActivationParam> act_param;
+  std::shared_ptr<ActivationParam> postsum_act_param;
 };
+
+static inline bool IsOutputUInt8(const MKLDNNConvFusionParam& param) {
+  const auto& mkldnn_param = param.full_conv_param.mkldnn_param;
+  auto IsOutputUInt8Helper = [](const int& act_type) {
+    return (act_type == activation::kReLU || act_type == activation::kSigmoid ||
+            act_type == activation::kSoftReLU);
+  };
+  if ((!mkldnn_param.with_sum) && mkldnn_param.with_relu) {
+    CHECK(param.act_param.get() != nullptr);
+    return IsOutputUInt8Helper(param.act_param->act_type);
+  } else if (mkldnn_param.with_postsum_relu) {
+    CHECK(param.postsum_act_param.get() != nullptr);
+    return IsOutputUInt8Helper(param.postsum_act_param->act_type);
+  }
+  return false;
+}
 
 enum MKLDNNConvOpOutputs { kOut, kMin, kMax };
 
