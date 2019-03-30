@@ -28,6 +28,7 @@
 #include "../nn/mkldnn/mkldnn_ops-inl.h"
 #include "../nn/mkldnn/mkldnn_base-inl.h"
 #include "../nn/mkldnn/mkldnn_slice-inl.h"
+#include "mkldnn_debug.h"
 
 namespace mxnet {
 namespace op {
@@ -765,6 +766,75 @@ NNVM_REGISTER_OP(_backward_clip)
 .set_attr<nnvm::TIsBackward>("TIsBackward", true)
 .set_attr<FCompute>("FCompute<cpu>", ClipGrad_<cpu>);
 
+bool SupportMKLDNNRepeat(const NDArray& input) {
+  int ndim = input.shape().ndim();
+  return input.dtype() == mshadow::kFloat32 && (ndim >= 1 && ndim <= 4) &&
+         input.storage_type() == kDefaultStorage;
+}
+
+#if MXNET_USE_MKLDNN == 1
+static inline bool RepeatStorageType(const nnvm::NodeAttrs& attrs,
+                                     const int dev_mask,
+                                     DispatchMode* dispatch_mode,
+                                     std::vector<int> *in_attrs,
+                                     std::vector<int> *out_attrs) {
+  CHECK_EQ(in_attrs->size(), 1);
+  CHECK_EQ(out_attrs->size(), 1);
+  return MKLDNNStorageType(attrs, dev_mask, true, dispatch_mode, in_attrs,
+                           out_attrs);
+}
+
+static void MKLDNNRepeat(const nnvm::NodeAttrs& attrs,
+                         const OpContext& ctx,
+                         const std::vector<NDArray>& inputs,
+                         const std::vector<OpReqType>& req,
+                         const std::vector<NDArray>& outputs) {
+  CHECK_EQ(outputs.size(), 1U);
+
+  NDArray data = inputs[0];
+  NDArray out = outputs[0];
+  auto in_mem = data.GetMKLDNNData();
+  auto src_format = in_mem->get_primitive_desc().desc().data.format;
+  auto src_def_format = GetDefaultFormat(in_mem->get_primitive_desc().desc());
+
+  if (src_def_format == src_format) {
+    FallBackCompute(RepeatOpForward<cpu>, attrs, ctx, inputs, req, outputs);
+  } else {
+    NDArray tmp_out = NDArray(out.storage_type(), out.shape(), out.ctx(), true, out.dtype());
+    FallBackCompute(RepeatOpForward<cpu>, attrs, ctx, inputs, req, {tmp_out});
+
+    auto tmp_out_mem = tmp_out.GetMKLDNNData();
+
+    mkldnn::memory::primitive_desc dst_pd =
+      GetPrimitiveDesc(out.GetMKLDNNData()->get_primitive_desc(), src_format);
+    mkldnn::memory *out_mem = const_cast<NDArray &>(outputs[0]).CreateMKLDNNData(dst_pd);
+    MKLDNNStream::Get()->RegisterPrim(mkldnn::reorder(*tmp_out_mem, *out_mem));
+    MKLDNNStream::Get()->Submit();
+  }
+}
+#endif
+
+void RepeatExCPU(const nnvm::NodeAttrs& attrs,
+                 const OpContext& ctx,
+                 const std::vector<NDArray>& inputs,
+                 const std::vector<OpReqType>& req,
+                 const std::vector<NDArray>& outputs) {
+  CHECK_EQ(inputs.size(), 1);
+  CHECK_EQ(outputs.size(), 1);
+  auto in_stype = inputs[0].storage_type();
+#if MXNET_USE_MKLDNN == 1
+  if (in_stype == kDefaultStorage) {
+    if (SupportMKLDNNRepeat(inputs[0])) {
+      MKLDNNRepeat(attrs, ctx, inputs, req, outputs);
+    } else {
+      FallBackCompute(RepeatOpForward<cpu>, attrs, ctx, inputs, req, outputs);
+    }
+  }
+#else
+  FallBackCompute(RepeatOpForward<cpu>, attrs, ctx, inputs, req, outputs);
+#endif
+}
+
 NNVM_REGISTER_OP(repeat)
 .describe(R"code(Repeats elements of an array.
 
@@ -800,6 +870,14 @@ The parameter ``axis`` specifies the axis along which to perform repeat::
 .set_attr<nnvm::FInferShape>("FInferShape", RepeatOpShape)
 .set_attr<nnvm::FInferType>("FInferType", RepeatOpType)
 .set_attr<FCompute>("FCompute<cpu>", RepeatOpForward<cpu>)
+.set_attr<FComputeEx>("FComputeEx<cpu>", RepeatExCPU)
+#if MXNET_USE_MKLDNN == 1
+.set_attr<FInferStorageType>("FInferStorageType", RepeatStorageType)
+.set_attr<bool>("TIsMKLDNN", true)
+.set_attr<FResourceRequest>("FResourceRequest", [](const NodeAttrs& n) {
+  return std::vector<ResourceRequest>{ResourceRequest::kTempSpace};
+})
+#endif
 .set_attr<nnvm::FGradient>("FGradient", ElemwiseGradUseNone{"_backward_repeat"})
 .add_argument("data", "NDArray-or-Symbol", "Input data array")
 .add_arguments(RepeatParam::__FIELDS__());
