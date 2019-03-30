@@ -574,7 +574,7 @@ void CachedOp::StaticInitExec(
     }
   } else {
     for (size_t i = start_nid; i < end_nid; ++i) {
-      exec::CreateOpExecs(g, &state.execs, i);
+      exec::CreateOpExecs(g, &state.execs, &state.op_states, i);
     }
     exec::AttachOpResources(g, state.execs, start_nid, end_nid);
 
@@ -589,14 +589,10 @@ void CachedOp::StaticInitExec(
       if (skip) continue;
       SetupOpExec(g, i, state.execs[i], state.arrays, state.array_reqs);
     }
-
-    size_t bulk_size = idx.num_nodes();
-    if (recording || keep_fwd) {
-      bulk_size = keep_fwd ? config_.backward_bulk_size : config_.forward_bulk_size;
-    }
-
-    CreateEngineOpSeg(idx, default_ctx, start_nid, end_nid, bulk_size,
-                      state.execs, skip_plus_node, &state.opr_segs);
+    size_t bulk_size =
+        (recording || keep_fwd) ? config_.backward_bulk_size : config_.forward_bulk_size;
+    CreateEngineOpSeg(idx, default_ctx, start_nid, end_nid, bulk_size, state.execs, skip_plus_node,
+                      &state.opr_segs);
   }
 
   if (keep_fwd) {
@@ -667,8 +663,6 @@ void CachedOp::StaticRunOps(
           arg_shapes.emplace_back(ndinput->shape());
           arg_dtypes.emplace_back(ndinput->dtype());
         }
-        state.op_states[i] = createop[node.source->op()](
-            node.source->attrs, default_ctx, arg_shapes, arg_dtypes);
         Imperative::Get()->InvokeOp(
             default_ctx, node.source->attrs, ndinputs, ndoutputs, req,
             dispatch_mode, state.op_states[i]);

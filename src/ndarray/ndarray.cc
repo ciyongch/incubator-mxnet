@@ -733,6 +733,11 @@ void NDArray::UpdateMKLDNNMemDesc(mkldnn::memory::format format) {
   ptr_->mkl_mem_.reset(new MKLDNNMemory(pd, ptr_->shandle.dptr));
   MKLDNNStream::Get()->RegisterMem(ptr_->mkl_mem_->GetMem());
 }
+
+void NDArray::UpdateMKLDNNMem(const std::shared_ptr<MKLDNNMemory> &mem) {
+  ptr_->mkl_mem_ = mem;
+  ptr_->mkl_mem_->SetDataHandle(ptr_->shandle.dptr);
+}
 #endif
 
 void NDArray::SetTBlob() const {
@@ -1826,7 +1831,7 @@ void NDArray::SyncCopyFromCPU(const void *data, size_t size) const {
 
   if (this->ctx().dev_mask() == cpu::kDevMask) {
     this->WaitToWrite();
-    RunContext rctx{this->ctx(), nullptr};
+    RunContext rctx{this->ctx(), nullptr, nullptr, false};
     TBlob dst = this->data();
     ndarray::Copy<cpu, cpu>(src, &dst, Context::CPU(), Context::CPU(), rctx);
   } else {
@@ -1957,7 +1962,7 @@ void NDArray::SyncCopyToCPU(void *data, size_t size) const {
 
   if (this->ctx().dev_mask() == cpu::kDevMask) {
     this->WaitToRead();
-    RunContext rctx{this->ctx(), nullptr};
+    RunContext rctx{this->ctx(), nullptr, nullptr, false};
     NDArray src = *this;
 #if MXNET_USE_MKLDNN == 1
     if (src.IsMKLDNNData())

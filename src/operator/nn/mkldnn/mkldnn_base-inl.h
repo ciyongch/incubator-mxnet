@@ -502,6 +502,11 @@ class MKLDNNMemory {
     size = pd.get_size();
   }
 
+  MKLDNNMemory(mkldnn::memory::primitive_desc pd): desc(pd.desc()) {
+    mem.reset(new mkldnn::memory(pd));
+    size = pd.get_size();
+  }
+
   explicit MKLDNNMemory(std::shared_ptr<mkldnn::memory> mem): desc(
       mem->get_primitive_desc().desc()) {
     this->mem = mem;

@@ -50,11 +50,11 @@ struct MKLDNNConvParam : public dmlc::Parameter<MKLDNNConvParam> {
     DMLC_DECLARE_FIELD(with_bn).set_default(false)
     .describe("Add post batchnorm.");
     DMLC_DECLARE_FIELD(with_relu).set_default(false)
-    .describe("Add post relu");
+    .describe("Add post activation");
     DMLC_DECLARE_FIELD(with_sum).set_default(false)
     .describe("Add post sum");
     DMLC_DECLARE_FIELD(with_postsum_relu).set_default(false)
-    .describe("Add post relu after sum");
+    .describe("Add post activation after sum");
     DMLC_DECLARE_FIELD(quantized).set_default(false)
     .describe("enable quantization");
     DMLC_DECLARE_FIELD(min_calib_range)
@@ -75,12 +75,9 @@ struct MKLDNNConvFullParam {
   MKLDNNConvParam mkldnn_param;
   float sum_scale;
   std::vector<float> requantize_scales;
+  mkldnn::algorithm relu_alg;
+  mkldnn::algorithm postsum_relu_alg;
 };
-
-static inline bool IsOutputUInt8(const MKLDNNConvParam &mkldnn_param) {
-  return ((!mkldnn_param.with_sum) && mkldnn_param.with_relu) ||
-         mkldnn_param.with_postsum_relu;
-}
 
 mkldnn::convolution_forward::primitive_desc GetConvFwdImpl(const MKLDNNConvFullParam &param,
                                                            const bool is_train,
