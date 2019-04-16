@@ -75,6 +75,7 @@ class SliceChannelOp : public Operator {
                        const std::vector<TBlob> &aux_args) {
     using namespace mshadow;
     using namespace mshadow::expr;
+//    LOG(INFO)<<"SliceChannelOp shape is "<< in_data[slice_enum::kData].shape_<<" axis is "<< axis_;
     CHECK_EQ(in_data.size(), 1U);
     CHECK_EQ(out_data.size(), static_cast<size_t>(size_));
     Stream<xpu> *s = ctx.get_stream<xpu>();
@@ -99,7 +100,16 @@ class SliceChannelOp : public Operator {
     for (int i = 0; i < size_; ++i) {
       outputs[i] = out_data[i].get_with_shape<xpu, 3, DType>(slice_shape, s);
     }
-    Split(data, &outputs, 1, req);
+
+//    LOG(INFO)<<"dshape "<<dshape<<" slice_shape "<<slice_shape <<" size_t "<<size_;
+    // 3D dshape and trailing==1, split_2d can be used to speedup
+    if (trailing == 1 && std::is_same<xpu, cpu>::value) {
+//      LOG(INFO)<<"hello split 2D";
+      Split_2D(data, &outputs, 1, req);
+    } else {
+      Split(data, &outputs, 1, req);
+    }
+
   }
 
   virtual void Backward(const OpContext &ctx,
