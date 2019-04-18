@@ -1,0 +1,94 @@
+diff --git a/src/cpu/ref_softmax.cpp b/src/cpu/ref_softmax.cpp
+index 5144ca6..de6d736 100644
+--- a/src/cpu/ref_softmax.cpp
++++ b/src/cpu/ref_softmax.cpp
+@@ -38,13 +38,22 @@ void ref_softmax_fwd_t<data_type>::execute_forward_dense() const {
+     auto src = reinterpret_cast<const data_t *>(this->input_memory(0));
+     auto dst = reinterpret_cast<data_t *>(this->memory(0));
+ 
++    const int axis = pd()->desc()->softmax_axis;
++    const memory_desc_wrapper data_d(pd()->src_pd());
++    const size_t ou_stride = axis > 0
++        ? data_d.blocking_desc().strides[0][axis - 1] : 1u;
++
++    constexpr float threshold = 80.f;
++    
+     parallel_nd(outer_size_, [&](int ou) {
+-        const data_t *src_data = src + ou * channels_;
+-        data_t *dst_data = dst + ou * channels_;
++        const data_t *src_data = src + ou * ou_stride;
++        data_t *dst_data = dst + ou * ou_stride;
+         data_t scalar = 0;
+ 
+         _max(channels_, src_data, &scalar);
+-        _sub(channels_, scalar, src_data, dst_data);
++        const float delta = scalar - threshold;
++
++        _sub(channels_, delta, src_data, dst_data);
+         _exp(channels_, dst_data, dst_data);
+         _sum(channels_, dst_data, &scalar);
+         _scal(channels_, data_t(1)/scalar, dst_data);
+@@ -205,19 +214,24 @@ void ref_softmax_bwd_t<data_type>::execute_backward_dense() const {
+     auto diff_dst = reinterpret_cast<const data_t *>(this->input_memory(1));
+     auto diff_src = reinterpret_cast<data_t *>(this->memory(0));
+ 
++    const int axis = pd()->desc()->softmax_axis;
++    const memory_desc_wrapper diff_d(pd()->diff_dst_pd());
++    const size_t ou_stride = axis > 0
++        ? diff_d.blocking_desc().strides[0][axis - 1] : 1u;
++
+     parallel_nd(outer_size_, [&](int ou) {
+         data_t sbr = 0;
+-        size_t off = channels_*ou;
+-        for (int c = 0; c < channels_; c++) {
++        size_t off = ou * ou_stride;
++        for (int c = 0; c < channels_; ++c) {
+             size_t loff = off + c;
+             data_t ldata = data[loff];
+             sbr += diff_dst[loff]*ldata;
+             diff_src[loff] = ldata;
+         }
+ 
+-        for(int c=0; c < channels_ ; ++c) {
+-          size_t loff = off + c;
+-          diff_src[loff] *= (diff_dst[loff] - sbr);
++        for(int c = 0; c < channels_; ++c) {
++            size_t loff = off + c;
++            diff_src[loff] *= (diff_dst[loff] - sbr);
+         }
+     });
+ }
+diff --git a/src/cpu/ref_softmax.hpp b/src/cpu/ref_softmax.hpp
+index 3de50fe..f385767 100644
+--- a/src/cpu/ref_softmax.hpp
++++ b/src/cpu/ref_softmax.hpp
+@@ -82,9 +82,12 @@ struct ref_softmax_fwd_t: public cpu_primitive_t {
+         inner_size_ = utils::array_product(dims + axis + 1, ndims - axis - 1);
+ 
+         const memory_desc_wrapper data_d(pd()->src_pd());
+-        use_dense_ = inner_size_ == 1 && data_d.is_dense()
+-            && data_d.blocking_desc().block_dims[axis] == 1
+-            && data_d.blocking_desc().strides[0][axis] == 1;
++        use_dense_ = true
++            && inner_size_ == 1
++            && data_d.is_dense(true)
++            && data_d.only_padded_dim(axis)
++            && data_d.blocking_desc().strides[0][axis] ==
++                    data_d.blocking_desc().block_dims[axis];
+     }
+     ~ref_softmax_fwd_t() {}
+ 
+@@ -153,9 +156,10 @@ struct ref_softmax_bwd_t: public cpu_primitive_t {
+         use_dense_ = true
+             && inner_size_ == 1
+             && diff_d == data_d
+-            && diff_d.is_dense()
+-            && diff_d.blocking_desc().block_dims[axis] == 1
+-            && diff_d.blocking_desc().strides[0][axis] == 1;
++            && diff_d.is_dense(true)
++            && diff_d.only_padded_dim(axis)
++            && diff_d.blocking_desc().strides[0][axis] ==
++                    diff_d.blocking_desc().block_dims[axis];
+     }
+     ~ref_softmax_bwd_t() {}
+ 
