@@ -58,6 +58,7 @@ struct FullyConnectedParam : public dmlc::Parameter<FullyConnectedParam> {
   int num_hidden;
   bool no_bias;
   bool flatten;
+  bool trans_data;
   DMLC_DECLARE_PARAMETER(FullyConnectedParam) {
     // TODO(bing) add support for boolean
     DMLC_DECLARE_FIELD(num_hidden).set_lower_bound(1)
@@ -66,11 +67,14 @@ struct FullyConnectedParam : public dmlc::Parameter<FullyConnectedParam> {
     .describe("Whether to disable bias parameter.");
     DMLC_DECLARE_FIELD(flatten).set_default(true)
     .describe("Whether to collapse all but the first axis of the input data tensor.");
+    DMLC_DECLARE_FIELD(trans_data).set_default(false)
+    .describe("Whether to transpose the input data tensor.");
   }
   bool operator==(const FullyConnectedParam& other) const {
     return this->num_hidden == other.num_hidden &&
            this->no_bias == other.no_bias &&
-           this->flatten == other.flatten;
+           this->flatten == other.flatten &&
+           this->trans_data == other.trans_data;
   }
 };
 
@@ -95,25 +99,40 @@ void FCForward(const OpContext &ctx, const FullyConnectedParam &param,
 
   Tensor<xpu, 2, DType> wmat = in_data[fullc::kWeight].get<xpu, 2, DType>(s);
   Tensor<xpu, 2, DType> data, out;
-  if (!param.flatten) {
-    data = in_data[fullc::kData].get_with_shape<xpu, 2, DType>(
-        Shape2(ishape.ProdShape(0, ishape.ndim()-1), ishape[ishape.ndim()-1]), s);
-    out = out_data[fullc::kOut].get_with_shape<xpu, 2, DType>(
-        Shape2(oshape.ProdShape(0, oshape.ndim()-1), oshape[oshape.ndim()-1]), s);
+  if (!param.trans_data) {
+    if (!param.flatten) {
+      data = in_data[fullc::kData].get_with_shape<xpu, 2, DType>(
+          Shape2(ishape.ProdShape(0, ishape.ndim()-1), ishape[ishape.ndim()-1]), s);
+      out = out_data[fullc::kOut].get_with_shape<xpu, 2, DType>(
+          Shape2(oshape.ProdShape(0, oshape.ndim()-1), oshape[oshape.ndim()-1]), s);
+    } else {
+      data = in_data[fullc::kData].get_with_shape<xpu, 2, DType>(
+          Shape2(ishape[0], ishape.ProdShape(1, ishape.ndim())), s);
+      out = out_data[fullc::kOut].get_with_shape<xpu, 2, DType>(
+          Shape2(oshape[0], oshape.ProdShape(1, oshape.ndim())), s);
+    }
   } else {
-    data = in_data[fullc::kData].get_with_shape<xpu, 2, DType>(
-        Shape2(ishape[0], ishape.ProdShape(1, ishape.ndim())), s);
-    out = out_data[fullc::kOut].get_with_shape<xpu, 2, DType>(
-        Shape2(oshape[0], oshape.ProdShape(1, oshape.ndim())), s);
+      data = in_data[fullc::kData].get_with_shape<xpu, 2, DType>(
+          Shape2(ishape[0], ishape[1]), s);
+      out = out_data[fullc::kOut].get_with_shape<xpu, 2, DType>(
+          Shape2(oshape[0], oshape[1]), s);
   }
 
-  CHECK_EQ(data.shape_[1], wmat.shape_[1])
-    << "Incomplete weight tensor detected: weight.data().shape[1] != prod(data.data().shape[1:])."
-       " This is not supported by FCForward. If weight is in row_sparse format,"
-       " please make sure all row ids are present.";
+  if (!param.trans_data) {
+    CHECK_EQ(data.shape_[1], wmat.shape_[1])
+      << "Incomplete weight tensor detected: weight.data().shape[1] != prod(data.data().shape[1:])."
+        " This is not supported by FCForward. If weight is in row_sparse format,"
+        " please make sure all row ids are present.";
+  } else {
+    CHECK_EQ(data.shape_[0], wmat.shape_[1])
+      << "Incomplete weight tensor detected: weight.data().shape[1] != prod(data.data().shape[1:])."
+        " This is not supported by FCForward. If weight is in row_sparse format,"
+        " please make sure all row ids are present.";
+  }
+
   // Legacy approach shown here for comparison:
   //   out = dot(data, wmat.T());
-  linalg_gemm(data, wmat, out, false, true, s);
+  linalg_gemm(data, wmat, out, param.trans_data, true, s);
   if (!param.no_bias) {
     Tensor<xpu, 1, DType> bias = in_data[fullc::kBias].get_with_shape<xpu, 1, DType>(
       Shape1(wmat.shape_[0]), s);
@@ -121,7 +140,11 @@ void FCForward(const OpContext &ctx, const FullyConnectedParam &param,
       << "Incomplete bias tensor detected: bias.data().shape[1] != weight.data().shape[0]."
          " This is not supported by FCForward. If bias is in row_sparse format, please"
          " make sure all row ids are present.";
-    out += repmat(bias, data.size(0));
+    if (!param.trans_data) {
+      out += repmat(bias, data.size(0));
+    } else {
+      out += repmat(bias, data.size(1));
+    }
   }
 }
 

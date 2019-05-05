@@ -32,6 +32,7 @@
 #include <vector>
 #include "../common.h"
 #include "../subgraph_property.h"
+#include "../../nn/fully_connected-inl.h"
 
 namespace mxnet {
 namespace op {
@@ -55,10 +56,15 @@ class SgMKLDNNFCSelector : public SubgraphSelector {
 
   bool Select(const nnvm::Node &n) override {
     if (n.op() == Op::Get("FullyConnected")) {
-      status = disable_fc_relu ? kSuccess : kStart;
-      matched_list.clear();
-      matched_list.push_back(&n);
-      return true;
+      const FullyConnectedParam& param = nnvm::get<FullyConnectedParam>(n.attrs.parsed);
+      if (param.trans_data == false) {
+        status = disable_fc_relu ? kSuccess : kStart;
+        matched_list.clear();
+        matched_list.push_back(&n);
+        return true;
+      } else {
+        return false;
+      }
     }
     return false;
   }

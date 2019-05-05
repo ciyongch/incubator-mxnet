@@ -55,12 +55,18 @@ static bool FullyConnectedShape(const nnvm::NodeAttrs& attrs,
   if (!mxnet::ndim_is_known(dshape)) return false;
 
   index_t num_input;
-  if (!param.flatten) {
-    num_input = dshape[dshape.ndim()-1];
+  if (!param.trans_data){
+    if (!param.flatten) {
+      num_input = dshape[dshape.ndim()-1];
+    } else {
+      num_input = dshape.ProdShape(1, dshape.ndim());
+    }
   } else {
-    num_input = dshape.ProdShape(1, dshape.ndim());
+    CHECK_EQ(dshape.ndim(), 2) << "trans_data only support 2-d input data.";
+    num_input = dshape[0];
   }
   SHAPE_ASSIGN_CHECK(*in_shape, fullc::kWeight, Shape2(param.num_hidden, num_input));
+
   if (!param.no_bias) {
     if (!shape_assign(&(*in_shape)[fullc::kBias], Shape1(param.num_hidden)) &&
         !shape_assign(&(*in_shape)[fullc::kBias], Shape2(param.num_hidden, 1))) {
@@ -68,13 +74,18 @@ static bool FullyConnectedShape(const nnvm::NodeAttrs& attrs,
     }
   }
 
-  if (!param.flatten) {
-    mxnet::TShape result_shape(dshape);
-    result_shape[dshape.ndim()-1] = param.num_hidden;
-    SHAPE_ASSIGN_CHECK(*out_shape, 0, result_shape);
+  if (!param.trans_data) {
+    if (!param.flatten) {
+      mxnet::TShape result_shape(dshape);
+      result_shape[dshape.ndim()-1] = param.num_hidden;
+      SHAPE_ASSIGN_CHECK(*out_shape, 0, result_shape);
+    } else {
+      SHAPE_ASSIGN_CHECK(*out_shape, 0, Shape2(dshape[0], param.num_hidden));
+    }
   } else {
-    SHAPE_ASSIGN_CHECK(*out_shape, 0, Shape2(dshape[0], param.num_hidden));
+    SHAPE_ASSIGN_CHECK(*out_shape, 0, Shape2(dshape[1], param.num_hidden))
   }
+
   if (oshape.ndim() > 0) {
     dshape[0] = oshape[0];
     SHAPE_ASSIGN_CHECK(*in_shape, fullc::kData, dshape);
@@ -100,7 +111,7 @@ void FullyConnectedComputeExCPU(const nnvm::NodeAttrs& attrs,
 #if MXNET_USE_MKLDNN == 1
   if (common::ContainsOnlyStorage(inputs, kDefaultStorage) &&
       common::ContainsOnlyStorage(outputs, kDefaultStorage)) {
-    if (SupportMKLDNNFC(inputs[0])) {
+    if (SupportMKLDNNFC(inputs[0]) && param.trans_data==false) {
       MKLDNN_OPCHECK_INIT(false, outputs.size(), inputs, outputs);
       MKLDNNFCForward(attrs, ctx, inputs, req, outputs);
       MKLDNN_OPCHECK_RUN(FullyConnectedCompute<cpu>, attrs, ctx, inputs, req,
