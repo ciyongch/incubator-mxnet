@@ -57,7 +57,7 @@ class SgMKLDNNFCSelector : public SubgraphSelector {
   bool Select(const nnvm::Node &n) override {
     if (n.op() == Op::Get("FullyConnected")) {
       const FullyConnectedParam& param = nnvm::get<FullyConnectedParam>(n.attrs.parsed);
-      if (param.trans_data == false) {
+      if (!param.trans_data && !param.trans_out) {
         status = disable_fc_relu ? kSuccess : kStart;
         matched_list.clear();
         matched_list.push_back(&n);

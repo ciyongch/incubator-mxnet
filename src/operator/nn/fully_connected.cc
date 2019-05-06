@@ -74,20 +74,30 @@ static bool FullyConnectedShape(const nnvm::NodeAttrs& attrs,
     }
   }
 
-  if (!param.trans_data) {
-    if (!param.flatten) {
-      mxnet::TShape result_shape(dshape);
-      result_shape[dshape.ndim()-1] = param.num_hidden;
-      SHAPE_ASSIGN_CHECK(*out_shape, 0, result_shape);
+  if (!param.trans_out) {
+    if (!param.trans_data) {
+      if (!param.flatten) {
+        mxnet::TShape result_shape(dshape);
+        result_shape[dshape.ndim()-1] = param.num_hidden;
+        SHAPE_ASSIGN_CHECK(*out_shape, 0, result_shape);
+      } else {
+        SHAPE_ASSIGN_CHECK(*out_shape, 0, Shape2(dshape[0], param.num_hidden));
+      }
     } else {
-      SHAPE_ASSIGN_CHECK(*out_shape, 0, Shape2(dshape[0], param.num_hidden));
+      SHAPE_ASSIGN_CHECK(*out_shape, 0, Shape2(dshape[1], param.num_hidden))
     }
   } else {
-    SHAPE_ASSIGN_CHECK(*out_shape, 0, Shape2(dshape[1], param.num_hidden))
+    CHECK_EQ(dshape.ndim(), 2) << "trans_out only support 2-d input data.";
+    SHAPE_ASSIGN_CHECK(*out_shape, 0, Shape2(param.num_hidden, dshape[0]))
   }
 
+
   if (oshape.ndim() > 0) {
-    dshape[0] = oshape[0];
+    if (!param.trans_out) {
+      dshape[0] = oshape[0];
+    } else {
+      dshape[0] = oshape[1];
+    }
     SHAPE_ASSIGN_CHECK(*in_shape, fullc::kData, dshape);
   }
   return true;
@@ -111,7 +121,7 @@ void FullyConnectedComputeExCPU(const nnvm::NodeAttrs& attrs,
 #if MXNET_USE_MKLDNN == 1
   if (common::ContainsOnlyStorage(inputs, kDefaultStorage) &&
       common::ContainsOnlyStorage(outputs, kDefaultStorage)) {
-    if (SupportMKLDNNFC(inputs[0]) && param.trans_data==false) {
+    if (SupportMKLDNNFC(inputs[0]) && param.trans_data==false && param.trans_out==false) {
       MKLDNN_OPCHECK_INIT(false, outputs.size(), inputs, outputs);
       MKLDNNFCForward(attrs, ctx, inputs, req, outputs);
       MKLDNN_OPCHECK_RUN(FullyConnectedCompute<cpu>, attrs, ctx, inputs, req,

@@ -59,6 +59,7 @@ struct FullyConnectedParam : public dmlc::Parameter<FullyConnectedParam> {
   bool no_bias;
   bool flatten;
   bool trans_data;
+  bool trans_out;
   DMLC_DECLARE_PARAMETER(FullyConnectedParam) {
     // TODO(bing) add support for boolean
     DMLC_DECLARE_FIELD(num_hidden).set_lower_bound(1)
@@ -69,12 +70,15 @@ struct FullyConnectedParam : public dmlc::Parameter<FullyConnectedParam> {
     .describe("Whether to collapse all but the first axis of the input data tensor.");
     DMLC_DECLARE_FIELD(trans_data).set_default(false)
     .describe("Whether to transpose the input data tensor.");
+    DMLC_DECLARE_FIELD(trans_out).set_default(false)
+    .describe("Whether to transpose the output data tensor.");
   }
   bool operator==(const FullyConnectedParam& other) const {
     return this->num_hidden == other.num_hidden &&
            this->no_bias == other.no_bias &&
            this->flatten == other.flatten &&
-           this->trans_data == other.trans_data;
+           this->trans_data == other.trans_data &&
+           this->trans_out == other.trans_out;
   }
 };
 
@@ -132,7 +136,12 @@ void FCForward(const OpContext &ctx, const FullyConnectedParam &param,
 
   // Legacy approach shown here for comparison:
   //   out = dot(data, wmat.T());
-  linalg_gemm(data, wmat, out, param.trans_data, true, s);
+  if (!param.trans_out) {
+    linalg_gemm(data, wmat, out, param.trans_data, true, s);
+  } else {
+    linalg_gemm(wmat, data, out, false, true, s);
+  }
+
   if (!param.no_bias) {
     Tensor<xpu, 1, DType> bias = in_data[fullc::kBias].get_with_shape<xpu, 1, DType>(
       Shape1(wmat.shape_[0]), s);
@@ -140,10 +149,14 @@ void FCForward(const OpContext &ctx, const FullyConnectedParam &param,
       << "Incomplete bias tensor detected: bias.data().shape[1] != weight.data().shape[0]."
          " This is not supported by FCForward. If bias is in row_sparse format, please"
          " make sure all row ids are present.";
-    if (!param.trans_data) {
-      out += repmat(bias, data.size(0));
+    if (!param.trans_out) {
+      if (!param.trans_data) {
+        out += repmat(bias, data.size(0));
+      } else {
+        out += repmat(bias, data.size(1));
+      }
     } else {
-      out += repmat(bias, data.size(1));
+      out += mshadow::expr::broadcast<0>(bias, out.shape_);
     }
   }
 }
