@@ -51,30 +51,46 @@ bool QuantizedFullyConnectedShape(const nnvm::NodeAttrs& attrs,
     << "QuantizedFullyConnectedOp input data shape must be given";
   const mxnet::TShape& dshape = in_shape->at(0);
   index_t num_input;
-  if (!param.flatten) {
-    num_input = dshape[dshape.ndim() - 1];
+
+  if (!param.trans_data) {
+    if (!param.flatten) {
+      num_input = dshape[dshape.ndim() - 1];
+    } else {
+      num_input = dshape.ProdShape(1, dshape.ndim());
+    }
   } else {
-    num_input = dshape.ProdShape(1, dshape.ndim());
+    CHECK_EQ(dshape.ndim(), 2) << "trans_data only support 2-d input data.";
+    num_input = dshape[0];
   }
 
   TShape wshape = Shape2(param.num_hidden, num_input);
-  SHAPE_ASSIGN_CHECK(*in_shape, 1, wshape);
+  SHAPE_ASSIGN_CHECK(*in_shape, fullc::kWeight, wshape);
   if (!param.no_bias) {
     mxnet::TShape bshape = Shape1(param.num_hidden);
-    SHAPE_ASSIGN_CHECK(*in_shape, 2, bshape);
+    SHAPE_ASSIGN_CHECK(*in_shape, fullc::kBias, bshape);
   }
 
   for (size_t i = num_inputs; i < 3 * num_inputs; ++i) {
     SHAPE_ASSIGN_CHECK(*in_shape, i, mxnet::TShape{1});
   }
 
-  if (!param.flatten) {
-    TShape result_shape(dshape);
-    result_shape[dshape.ndim() - 1] = param.num_hidden;
-    SHAPE_ASSIGN_CHECK(*out_shape, 0, result_shape);
+  if (!param.trans_out) {
+    if (!param.trans_data) {
+      if (!param.flatten) {
+        TShape result_shape(dshape);
+        result_shape[dshape.ndim() - 1] = param.num_hidden;
+        SHAPE_ASSIGN_CHECK(*out_shape, 0, result_shape);
+      } else {
+        SHAPE_ASSIGN_CHECK(*out_shape, 0, Shape2(dshape[0], param.num_hidden));
+      }
+    } else {
+      SHAPE_ASSIGN_CHECK(*out_shape, 0, Shape2(dshape[1], param.num_hidden));
+    }
   } else {
-    SHAPE_ASSIGN_CHECK(*out_shape, 0, Shape2(dshape[0], param.num_hidden));
+    CHECK_EQ(dshape.ndim(), 2) << "trans_out only support 2-d input data.";
+    SHAPE_ASSIGN_CHECK(*out_shape, 0, Shape2(param.num_hidden, dshape[0]));
   }
+
   SHAPE_ASSIGN_CHECK(*out_shape, 1, mxnet::TShape(1, 1));
   SHAPE_ASSIGN_CHECK(*out_shape, 2, mxnet::TShape(1, 1));
   return true;
@@ -119,7 +135,10 @@ bool QuantizedFullyConnectedStorageType(const nnvm::NodeAttrs& attrs,
   CHECK_EQ(out_attrs->size(), 3U);
 
 #if MXNET_USE_MKLDNN == 1
-  return MKLDNNStorageType(attrs, dev_mask, true,
+  bool support_mkldnn = true;
+  if (param.trans_data || param.trans_out)
+    support_mkldnn = false;
+  return MKLDNNStorageType(attrs, dev_mask, support_mkldnn,
                            dispatch_mode, in_attrs, out_attrs);
 #else
   *dispatch_mode = DispatchMode::kFCompute;
@@ -194,14 +213,17 @@ void QuantizedFullyConnectedForwardCPU(const nnvm::NodeAttrs& attrs,
         << "QuantizedFullyConnectedForwardCPU only supports flatten=true "
         << "when dshape.ndim() != 2 for now.";
 
+  if (param.trans_data || param.trans_out)
+    CHECK_EQ(dshape.ndim(), 2U) << "trans_data or trans_out only supports 2D data input so far.";
+
   Tensor<cpu, 2, int8_t> weight = in_data[fullc::kWeight].get<cpu, 2, int8_t>(s);
   Tensor<cpu, 2, int8_t> data = in_data[fullc::kData].get_with_shape<cpu, 2, int8_t>(
     Shape2(dshape[0], dshape.ProdShape(1, dshape.ndim())), s);
   Tensor<cpu, 2, int32_t> out = out_data[fullc::kOut].get_with_shape<cpu, 2, int32_t>(
     Shape2(oshape[0], oshape.ProdShape(1, oshape.ndim())), s);
 
-  auto data_temp = data.dptr_;
-  auto weight_temp = weight.dptr_;
+  auto matrix_a = data.dptr_;
+  auto matrix_b = weight.dptr_;
   auto output_temp = out.dptr_;
   const int omp_threads = mxnet::engine::OpenMP::Get()->GetRecommendedOMPThreadCount();
   const float alpha = 1.0f;
@@ -210,7 +232,21 @@ void QuantizedFullyConnectedForwardCPU(const nnvm::NodeAttrs& attrs,
   const MKL_INT8 oa = 0;
   const MKL_INT8 ob = 0;
   MKL_INT32 oc = 0;
-  const int m = dshape[0], n = wshape[0], k = dshape.ProdShape(1, dshape.ndim());
+  int m = dshape[0], n = wshape[0], k = dshape.ProdShape(1, dshape.ndim());
+
+  if (param.trans_data) {
+    m = dshape[1];
+    k = dshape[0];
+    n = wshape[0];
+  }
+  if (param.trans_out) {
+    m = wshape[0];
+    k = dshape[1];
+    n = dshape[0];
+
+    matrix_a = weight.dptr_;
+    matrix_b = data.dptr_;
+  }
   //  cblas_gemm_s8u8s32 required first matrix must be uint8
   //  shift data from int8(from -128 to 127) to uint8 (from 0 to 255)
   int shift = 128;
@@ -219,7 +255,7 @@ void QuantizedFullyConnectedForwardCPU(const nnvm::NodeAttrs& attrs,
       Shape1(m * k), s);
   #pragma omp parallel for num_threads(omp_threads)
   for (int i = 0; i < m * k; ++i) {
-    shiftdata.dptr_[i] = data_temp[i] + shift;
+    shiftdata.dptr_[i] = matrix_a[i] + shift;
   }
 
   Tensor<cpu, 1, float> min_output = out_data[quantized_fullc::kOutMin].get<cpu, 1, float>(s);
@@ -243,7 +279,8 @@ void QuantizedFullyConnectedForwardCPU(const nnvm::NodeAttrs& attrs,
     Tensor<cpu, 1, float> max_bias =
       in_data[num_inputs + quantized_fullc::kBiasMax].get<cpu, 1, float>(s);
 
-    Kernel<QuantizedSumInitKernelWithBias, cpu>::Launch(s, n, out.dptr_,
+    auto bias_size = wshape[0];
+    Kernel<QuantizedSumInitKernelWithBias, cpu>::Launch(s, bias_size, out.dptr_,
         bias.dptr_, min_output.dptr_, max_output.dptr_, min_bias.dptr_, max_bias.dptr_);
   } else {
     #pragma omp parallel for num_threads(omp_threads)
@@ -254,16 +291,24 @@ void QuantizedFullyConnectedForwardCPU(const nnvm::NodeAttrs& attrs,
   #pragma omp parallel for num_threads(omp_threads)
   for (int i = 0; i < n; ++i) {
     for (int j = 0; j < k; ++j) {
-      output_temp[i] -= shift * weight_temp[i * k + j];
+      output_temp[i] -= shift * matrix_b[i * k + j];
     }
   }
   #pragma omp parallel for num_threads(omp_threads)
   for (int i = n; i < m * n; ++i) {
     output_temp[i] = output_temp[i % n];
   }
+
+  auto trans_a = CblasNoTrans;
+  auto trans_b = CblasTrans;
+
+  if (param.trans_data) {
+    trans_a = CblasTrans;
+  }
+
   cblas_gemm_s8u8s32(CblasRowMajor,
-                     CblasNoTrans,
-                     CblasTrans,
+                     trans_a,
+                     trans_b,
                      offsetc,
                      m,
                      n,
@@ -272,7 +317,7 @@ void QuantizedFullyConnectedForwardCPU(const nnvm::NodeAttrs& attrs,
                      shiftdata.dptr_,
                      k,
                      oa,
-                     weight.dptr_,
+                     matrix_b,
                      k,
                      ob,
                      beta,
