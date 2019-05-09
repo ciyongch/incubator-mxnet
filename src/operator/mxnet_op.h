@@ -203,6 +203,24 @@ inline int get_num_threads<cpu>(const int N) {
     LOG(FATAL) << "Unknown type enum " << type;            \
   }
 
+#define MXNET_INT8_TYPE_SWITCH(type, DType, ...)   \
+  switch (type) {                                  \
+  case mshadow::kUint8:                            \
+    {                                              \
+      typedef uint8_t DType;                       \
+      {__VA_ARGS__}                                \
+    }                                              \
+    break;                                         \
+  case mshadow::kInt8:                             \
+    {                                              \
+      typedef int8_t DType;                        \
+      {__VA_ARGS__}                                \
+    }                                              \
+    break;                                         \
+  default:                                         \
+    LOG(FATAL) << "Unknown type enum " << type;    \
+  }
+
 #define MXNET_NO_FLOAT16_TYPE_SWITCH(type, DType, ...)     \
   switch (type) {                                          \
   case mshadow::kFloat32:                                  \
