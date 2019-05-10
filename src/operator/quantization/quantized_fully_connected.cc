@@ -58,6 +58,14 @@ class QuantizedFullyConnectedOp {
                   "inference computation.";
   }
 
+  ~QuantizedFullyConnectedOp() {
+   #if _MSC_VER
+     _aligned_free(temp_space_);
+   #else
+     free(temp_space_);
+   #endif
+  }
+
  private:
   bool initialized_;
   FullyConnectedParam param_;
@@ -69,7 +77,13 @@ class QuantizedFullyConnectedOp {
   float cached_max_bias_;
   float cached_min_out_;
   float cached_max_out_;
-  Tensor<cpu, 1, char> temp_space_;
+  //Tensor<cpu, 1, char> temp_space_;
+  char * temp_space_;
+  uint8_t* shifted_matrix_a_ptr = nullptr;
+  int8_t* shifted_matrix_b_ptr = nullptr;
+  int32_t* data_reduction_ptr = nullptr;
+  int32_t* int32_bias_ptr = nullptr;
+  int32_t* weight_reduction_ptr = nullptr;
 };
 
 bool QuantizedFullyConnectedShape(const nnvm::NodeAttrs& attrs,
@@ -272,11 +286,6 @@ void QuantizedFullyConnectedOp::Forward(const OpContext &ctx,
   //  cblas_gemm_s8u8s32 required first matrix must be uint8
   //  shift data from int8(from -128 to 127) to uint8 (from 0 to 255)
   int shift = 128;
-  uint8_t* shifted_matrix_a_ptr = nullptr;
-  int8_t* shifted_matrix_b_ptr = nullptr;
-  int32_t* data_reduction_ptr = nullptr;
-  int32_t* int32_bias_ptr = nullptr;
-  int32_t* weight_reduction_ptr = nullptr;
 
   if (param_.trans_data) {
     m = dshape[1];
@@ -307,19 +316,6 @@ void QuantizedFullyConnectedOp::Forward(const OpContext &ctx,
       (in_data[num_inputs + quantized_fullc::kBiasMax].get<cpu, 1, float>(s)).dptr_[0];
   }
 
-  /*
-  Tensor<cpu, 1, float> max_data =
-    in_data[num_inputs + quantized_fullc::kDataMax].get<cpu, 1, float>(s);
-  Tensor<cpu, 1, float> min_weight =
-    in_data[num_inputs + quantized_fullc::kWeightMin].get<cpu, 1, float>(s);
-  Tensor<cpu, 1, float> max_weight =
-    in_data[num_inputs + quantized_fullc::kWeightMax].get<cpu, 1, float>(s);
-    Tensor<cpu, 1, float> min_bias =
-      in_data[num_inputs + quantized_fullc::kBiasMin].get<cpu, 1, float>(s);
-    Tensor<cpu, 1, float> max_bias =
-      in_data[num_inputs + quantized_fullc::kBiasMax].get<cpu, 1, float>(s);
-  */
-
   if (initialized_) {
     if (cached_min_data_ != min_data || cached_max_data_ != max_data ||
         cached_min_weight_ != min_weight || cached_max_weight_ != max_weight ||
@@ -329,21 +325,6 @@ void QuantizedFullyConnectedOp::Forward(const OpContext &ctx,
   }
 
   if (!initialized_) {
-    // TODO, DEBUG
-    if (data_is_int8)
-      std::cout << "s8, ";
-    else
-      std::cout << "u8, ";
-
-    if (!param_.no_bias)
-      std::cout << "with_bias, ";
-    if (param_.trans_data)
-      std::cout << "trans+fc, ";
-    if (param_.trans_out)
-      std::cout << "fc+trans, ";
-
-    std::cout << "\n";
-
     cached_min_data_ = min_data;
     cached_max_data_ = max_data;
     cached_min_weight_ = min_weight;
@@ -399,10 +380,21 @@ void QuantizedFullyConnectedOp::Forward(const OpContext &ctx,
     char* temp_space_curr_ptr = nullptr;
     if (temp_space_size > 0) {
       // allocate enough memory for later use
+      // TODO: requested memory buffer will be reused by FW, need to make it unique.
+      /*
       temp_space_ = ctx.requested[quantized_fc::kTempSpace].get_space_typed<cpu, 1, char>(
           Shape1(temp_space_size), s);
 
       temp_space_curr_ptr = temp_space_.dptr_;
+      */
+      #if _MSC_VER
+        temp_space_ = _reinterprect_cast<char *>(aligned_malloc(temp_space_size, 64));
+        if (temp_space_ == nullptr) LOG(FATAL) << "Failed to allocate CPU Memory";
+      #else
+        int ret = posix_memalign(reinterpret_cast<void **>(&temp_space_), 64, temp_space_size);
+        if (ret != 0) LOG(FATAL) << "Failed to allocate CPU Memory";
+      #endif
+      temp_space_curr_ptr = temp_space_;
     }
 
     if (param_.trans_out) {
@@ -576,7 +568,7 @@ void QuantizedFullyConnectedOp::Forward(const OpContext &ctx,
                      ldb,
                      ob,
                      beta,
-                     out.dptr_,
+                     output_temp,
                      ldc,
                      &oc);
 #else
@@ -650,7 +642,7 @@ and max thresholds representing the threholds for quantizing the float32 output 
 .set_attr<nnvm::FInferType>("FInferType", QuantizedFullyConnectedType)
 .set_attr<FInferStorageType>("FInferStorageType", QuantizedFullyConnectedStorageType)
 .set_attr<FCreateOpState>("FCreateOpState", CreateQuantizedFullyConnectedState)
-.set_attr<FStatefulCompute>("FStatefulComputeEx<cpu>", QuantizedFullyConnectedForwardCPU)
+.set_attr<FStatefulCompute>("FStatefulCompute<cpu>", QuantizedFullyConnectedForwardCPU)
 // TODO(Xinyu): a temp solution to enable GluonCV INT8 flow,
 // will be reverted after the improvement of CachedOP is done.
 .set_attr<nnvm::FGradient>("FGradient", MakeZeroGradNodes)
