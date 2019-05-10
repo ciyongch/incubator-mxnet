@@ -38,6 +38,40 @@ namespace quantized_fc {
 enum QuantizedfcOpResource {kTempSpace};
 }
 
+class QuantizedFullyConnectedOp {
+ public:
+  explicit QuantizedFullyConnectedOp(const nnvm::NodeAttrs &attrs)
+    : initialized_(false),
+      param_(nnvm::get<FullyConnectedParam>(attrs.parsed)) {}
+
+  template<typename DType>
+  void Forward(const OpContext &ctx,
+               const std::vector<TBlob> &inputs,
+               const std::vector<OpReqType> &req,
+               const std::vector<TBlob> &outputs);
+
+  void Backward(const OpContext &ctx,
+                const std::vector<TBlob> &inputs,
+                const std::vector<OpReqType> &req,
+                const std::vector<TBlob> &outputs) {
+    LOG(FATAL) << "Not implemented: QuantizedFullyConnected only supports "
+                  "inference computation.";
+  }
+
+ private:
+  bool initialized_;
+  FullyConnectedParam param_;
+  float cached_min_data_;
+  float cached_max_data_;
+  float cached_min_weight_;
+  float cached_max_weight_;
+  float cached_min_bias_;
+  float cached_max_bias_;
+  float cached_min_out_;
+  float cached_max_out_;
+  Tensor<cpu, 1, char> temp_space_;
+};
+
 bool QuantizedFullyConnectedShape(const nnvm::NodeAttrs& attrs,
                                   mxnet::ShapeVector *in_shape,
                                   mxnet::ShapeVector *out_shape) {
@@ -162,41 +196,42 @@ bool QuantizedFullyConnectedStorageType(const nnvm::NodeAttrs& attrs,
 
 struct QuantizedSumInitKernelWithBias {
   //  init sum data with bias for matrix b (n)
-  MSHADOW_XINLINE static void Map(int i, int32_t *out,
-                                  const int8_t *bias, const float *min_out,
-                                  const float *max_out, const float *min_bias,
-                                  const float *max_bias) {
+  MSHADOW_XINLINE static void Map(int i, int32_t *out, const int8_t *bias,
+                                  const float min_out, const float max_out,
+                                  const float min_bias, const float max_bias) {
     typedef int32_t T1;
     typedef int8_t  T2;
     using mshadow::red::limits::MinValue;
     using mshadow::red::limits::MaxValue;
     float float_for_one_out_quant  =
-        MaxAbs(*min_out, *max_out) / static_cast<double>(MaxValue<T1>());
+        MaxAbs(min_out, max_out) / static_cast<double>(MaxValue<T1>());
     float float_for_one_bias_quant =
-        MaxAbs(*min_bias, *max_bias) / static_cast<double>(MaxValue<T2>());
+        MaxAbs(min_bias, max_bias) / static_cast<double>(MaxValue<T2>());
     if (float_for_one_out_quant != 0) {
       out[i] = bias[i] * float_for_one_bias_quant /
           float_for_one_out_quant;
     } else {
       LOG(INFO) << "float_for_one_out_quant is 0,"
-                << " need to check the why MaxAbs(*min_out, *max_out) of out_data is 0!";
+                << " need to check the why MaxAbs(min_out, max_out) of out_data is 0!";
       out[i] = 0;
     }
   }
 };
 
+static inline size_t PadBytes(size_t num_bytes, size_t alignment=64) {
+  return (num_bytes + (alignment - num_bytes % alignment) % alignment);
+}
+
 template <typename DType>
-void QuantizedFullyConnectedForwardCPU_(const nnvm::NodeAttrs& attrs,
-                                        const OpContext &ctx,
+void QuantizedFullyConnectedOp::Forward(const OpContext &ctx,
                                         const std::vector<TBlob> &in_data,
                                         const std::vector<OpReqType> &req,
                                         const std::vector<TBlob> &out_data) {
 #if MSHADOW_USE_MKL == 1
-  const FullyConnectedParam& param = nnvm::get<FullyConnectedParam>(attrs.parsed);
   using namespace mshadow;
   using namespace mxnet_op;
   Stream<cpu> *s = ctx.get_stream<cpu>();
-  size_t num_inputs = param.no_bias ? 2 : 3;
+  size_t num_inputs = param_.no_bias ? 2 : 3;
   CHECK_EQ(in_data.size(),  num_inputs * 3);
   CHECK_EQ(out_data.size(), 3U);
 
@@ -204,31 +239,25 @@ void QuantizedFullyConnectedForwardCPU_(const nnvm::NodeAttrs& attrs,
   const mxnet::TShape &wshape = in_data[fullc::kWeight].shape_;
   const mxnet::TShape &oshape = out_data[fullc::kOut].shape_;
 
-  /*
-  CHECK(in_data[fullc::kData].type_flag_ == mshadow::kInt8)
-    << "QuantizedFullyConnectedForwardCPU Op only supports int8 for now, but got "
-    << mxnet::op::type_string(in_data[fullc::kData].type_flag_);
-  */
+  if (dshape.ndim() != 2)
+    CHECK(param_.flatten)
+        << "QuantizedFullyConnectedForwardCPU only supports flatten=true "
+        << "when dshape.ndim() != 2 for now.";
+
+  if (param_.trans_data || param_.trans_out)
+    CHECK_EQ(dshape.ndim(), 2U) << "trans_data or trans_out only supports 2D data input so far.";
+
   bool data_is_int8 = true;
   if(in_data[fullc::kData].type_flag_ == mshadow::kUint8)
     data_is_int8 = false;
 
-
-  if (dshape.ndim() != 2)
-    CHECK(param.flatten)
-        << "QuantizedFullyConnectedForwardCPU only supports flatten=true "
-        << "when dshape.ndim() != 2 for now.";
-
-  if (param.trans_data || param.trans_out)
-    CHECK_EQ(dshape.ndim(), 2U) << "trans_data or trans_out only supports 2D data input so far.";
-
-  Tensor<cpu, 2, int8_t> weight = in_data[fullc::kWeight].get<cpu, 2, int8_t>(s);
   Tensor<cpu, 2, DType> data = in_data[fullc::kData].get_with_shape<cpu, 2, DType>(
     Shape2(dshape[0], dshape.ProdShape(1, dshape.ndim())), s);
+  Tensor<cpu, 2, int8_t> weight = in_data[fullc::kWeight].get<cpu, 2, int8_t>(s);
   Tensor<cpu, 2, int32_t> out = out_data[fullc::kOut].get_with_shape<cpu, 2, int32_t>(
     Shape2(oshape[0], oshape.ProdShape(1, oshape.ndim())), s);
 
-  auto matrix_a = data.dptr_;
+  DType* matrix_a = data.dptr_;
   int8_t* matrix_b = weight.dptr_;
   int32_t* output_temp = out.dptr_;
   const int omp_threads = mxnet::engine::OpenMP::Get()->GetRecommendedOMPThreadCount();
@@ -239,147 +268,284 @@ void QuantizedFullyConnectedForwardCPU_(const nnvm::NodeAttrs& attrs,
   const MKL_INT8 ob = 0;
   MKL_INT32 oc = 0;
   int m = dshape[0], n = wshape[0], k = dshape.ProdShape(1, dshape.ndim());
-  float data_scale = 1.0;
-  float weight_scale = 1.0;
 
   //  cblas_gemm_s8u8s32 required first matrix must be uint8
   //  shift data from int8(from -128 to 127) to uint8 (from 0 to 255)
   int shift = 128;
-  Tensor<cpu, 1, uint8_t> shifted_matrix_a;
-  Tensor<cpu, 1, int8_t> shifted_matrix_b;  // used by trans_out and input data is uint8.
+  uint8_t* shifted_matrix_a_ptr = nullptr;
+  int8_t* shifted_matrix_b_ptr = nullptr;
+  int32_t* data_reduction_ptr = nullptr;
+  int32_t* int32_bias_ptr = nullptr;
+  int32_t* weight_reduction_ptr = nullptr;
 
-  if (param.trans_data) {
+  if (param_.trans_data) {
     m = dshape[1];
     k = dshape[0];
     n = wshape[0];
   }
-  if (param.trans_out) {
+  if (param_.trans_out) {
     m = wshape[0];
     k = dshape[1];
     n = dshape[0];
-
-    // Swap the order of data and weight, so the first input is always int8, shift it to uint8.
-    shifted_matrix_a =
-      ctx.requested[quantized_fc::kTempSpace].get_space_typed<cpu, 1, uint8_t>(Shape1(m * k), s);
-    #pragma omp parallel for num_threads(omp_threads)
-    for (int i = 0; i < m * k; ++i) {
-      shifted_matrix_a.dptr_[i] = weight.dptr_[i] + shift;
-    }
-
-    if (!data_is_int8) {
-    // when data is in uint8, need to shift data from uint8 to int8 according to s8u8s32 API.
-      shifted_matrix_b =
-        ctx.requested[quantized_fc::kTempSpace].get_space_typed<cpu, 1, int8_t>(Shape1(n * k), s);
-      #pragma omp parallel for num_threads(omp_threads)
-      for (int i = 0; i < n * k; ++i) {
-        shifted_matrix_b.dptr_[i] = data.dptr_[i] - shift;
-      }
-      matrix_b = shifted_matrix_b.dptr_;
-    } else {
-      matrix_b = reinterpret_cast<int8_t *>(data.dptr_);
-    }
-  } else {
-    if (data_is_int8) {
-      shifted_matrix_a =
-        ctx.requested[quantized_fc::kTempSpace].get_space_typed<cpu, 1, uint8_t>(Shape1(m * k), s);
-      #pragma omp parallel for num_threads(omp_threads)
-      for (int i = 0; i < m * k; ++i) {
-        shifted_matrix_a.dptr_[i] = matrix_a[i] + shift;
-      }
-    }
   }
 
   Tensor<cpu, 1, float> min_output = out_data[quantized_fullc::kOutMin].get<cpu, 1, float>(s);
   Tensor<cpu, 1, float> max_output = out_data[quantized_fullc::kOutMax].get<cpu, 1, float>(s);
-  Tensor<cpu, 1, float> min_data =
-    in_data[num_inputs + quantized_fullc::kDataMin].get<cpu, 1, float>(s);
+  float min_data = (in_data[num_inputs + quantized_fullc::kDataMin].get<cpu, 1, float>(s)).dptr_[0];
+  float max_data = (in_data[num_inputs + quantized_fullc::kDataMax].get<cpu, 1, float>(s)).dptr_[0];
+  float min_weight =
+    (in_data[num_inputs + quantized_fullc::kWeightMin].get<cpu, 1, float>(s)).dptr_[0];
+  float max_weight =
+    (in_data[num_inputs + quantized_fullc::kWeightMax].get<cpu, 1, float>(s)).dptr_[0];
+  float min_bias = 0.0;
+  float max_bias = 0.0;
+
+  if (!param_.no_bias) {
+    min_bias =
+      (in_data[num_inputs + quantized_fullc::kBiasMin].get<cpu, 1, float>(s)).dptr_[0];
+    max_bias =
+      (in_data[num_inputs + quantized_fullc::kBiasMax].get<cpu, 1, float>(s)).dptr_[0];
+  }
+
+  /*
   Tensor<cpu, 1, float> max_data =
     in_data[num_inputs + quantized_fullc::kDataMax].get<cpu, 1, float>(s);
   Tensor<cpu, 1, float> min_weight =
     in_data[num_inputs + quantized_fullc::kWeightMin].get<cpu, 1, float>(s);
   Tensor<cpu, 1, float> max_weight =
     in_data[num_inputs + quantized_fullc::kWeightMax].get<cpu, 1, float>(s);
-
-  weight_scale = kInt8Range / MaxAbs(*min_weight.dptr_, *max_weight.dptr_);
-  data_scale = (data_is_int8 ? kInt8Range : kUint8Range) / MaxAbs(*min_data.dptr_, *max_data.dptr_);
-
-  Kernel<QuantizationRangeForMultiplicationStruct, cpu>::Launch(s, 1, min_output.dptr_,
-      max_output.dptr_, min_data.dptr_, max_data.dptr_, min_weight.dptr_, max_weight.dptr_);
-  if (!param.no_bias) {
-    Tensor<cpu, 1, int8_t> bias = in_data[fullc::kBias].get_with_shape<cpu, 1, int8_t>(
-      Shape1(wshape[0]), s);
     Tensor<cpu, 1, float> min_bias =
       in_data[num_inputs + quantized_fullc::kBiasMin].get<cpu, 1, float>(s);
     Tensor<cpu, 1, float> max_bias =
       in_data[num_inputs + quantized_fullc::kBiasMax].get<cpu, 1, float>(s);
+  */
 
-    auto bias_size = wshape[0];
-    if (param.trans_out) {
-    // out.shape: num_hidden x batchsize
-    // TODO: update output with converted bias and shift. consider both shift_a and shift_b.
-    // TempSpace is used to stored int32_bias, weight and data sum reduction results.
-      Tensor<cpu, 1, int32_t> temp_buffer =
-        ctx.requested[quantized_fc::kTempSpace].get_space_typed<cpu, 1, int32_t>(
-          Shape1(bias_size + m + n), s);
-      int32_t* int32_bias_ptr = temp_buffer.dptr_;
-      int32_t* weight_reduction_ptr = temp_buffer.dptr_ + bias_size;
-      int32_t* data_reduction_ptr = temp_buffer.dptr_ + bias_size + m;
+  if (initialized_) {
+    if (cached_min_data_ != min_data || cached_max_data_ != max_data ||
+        cached_min_weight_ != min_weight || cached_max_weight_ != max_weight ||
+        (!param_.no_bias && (cached_min_bias_ != min_bias || cached_max_bias_ != max_bias))) {
+          initialized_ = false;
+        }
+  }
 
-      // TODO: cached
+  if (!initialized_) {
+    // TODO, DEBUG
+    if (data_is_int8)
+      std::cout << "s8, ";
+    else
+      std::cout << "u8, ";
+
+    if (!param_.no_bias)
+      std::cout << "with_bias, ";
+    if (param_.trans_data)
+      std::cout << "trans+fc, ";
+    if (param_.trans_out)
+      std::cout << "fc+trans, ";
+
+    std::cout << "\n";
+
+    cached_min_data_ = min_data;
+    cached_max_data_ = max_data;
+    cached_min_weight_ = min_weight;
+    cached_max_weight_ = max_weight;
+    if (!param_.no_bias) {
+      cached_min_bias_ = min_bias;
+      cached_max_bias_ = max_bias;
+    }
+
+    float data_scale = (data_is_int8 ? kInt8Range : kUint8Range) /
+        MaxAbs(cached_min_data_, cached_max_data_);
+    float weight_scale = kInt8Range / MaxAbs(cached_min_weight_, cached_max_weight_);
+    size_t bias_size = 0;
+    size_t temp_space_size = 0;
+    Tensor<cpu, 1, int8_t> bias;
+
+    if (!param_.no_bias) {
+      bias = in_data[fullc::kBias].get_with_shape<cpu, 1, int8_t>(Shape1(wshape[0]), s);
+
+      bias_size = wshape[0];
+      // rescaled int32_bias
+      temp_space_size += PadBytes(bias_size * sizeof(int32_t));
+    }
+
+    Kernel<QuantizationRangeForMultiplicationStruct, cpu>::Launch(
+        s, 1, &cached_min_out_, &cached_max_out_, &cached_min_data_, &cached_max_data_,
+        &cached_min_weight_, &cached_max_weight_);
+
+    if (param_.trans_out) {
+      // shifted_matrix_a
+      temp_space_size += PadBytes(m * k);
+
+      // data(matrix_b) reduction
+      temp_space_size += PadBytes(n * sizeof(int32_t));
+
+      if (!data_is_int8) {
+        // shifed_matrix_b
+        temp_space_size += PadBytes(n * k);
+
+        // weight(matrix_a) reduction
+        temp_space_size += PadBytes(m * sizeof(int32_t));
+      }
+    } else {
+      if (data_is_int8) {
+        // shifted_matrix_a
+        temp_space_size += PadBytes(m * k);
+
+        // weight(matrix_b) reduction
+        temp_space_size += PadBytes(n * sizeof(int32_t));
+      }
+    }
+
+    char* temp_space_curr_ptr = nullptr;
+    if (temp_space_size > 0) {
+      // allocate enough memory for later use
+      temp_space_ = ctx.requested[quantized_fc::kTempSpace].get_space_typed<cpu, 1, char>(
+          Shape1(temp_space_size), s);
+
+      temp_space_curr_ptr = temp_space_.dptr_;
+    }
+
+    if (param_.trans_out) {
+      // weight x data(T)
+      // matrix_a is weight, need to convert it from int8_t to uint8_t.
+      shifted_matrix_a_ptr = reinterpret_cast<uint8_t*>(temp_space_curr_ptr);
+      temp_space_curr_ptr += PadBytes(m * k);
+
+      #pragma omp parallel for num_threads(omp_threads)
+      for (index_t i = 0; i < static_cast<index_t>(m * k); ++i) {
+        shifted_matrix_a_ptr[i] = weight.dptr_[i] + shift;
+      }
+
+      data_reduction_ptr = reinterpret_cast<int32_t*>(temp_space_curr_ptr);
+      temp_space_curr_ptr += PadBytes(n * sizeof(int32_t));
+
+      if (!data_is_int8) {
+        // matrix_b is data, when data is uint8_t, need to convert to int8_t.
+        // Get the buffer for converted data, and do online shifting.
+        shifted_matrix_b_ptr = reinterpret_cast<int8_t*>(temp_space_curr_ptr);
+        temp_space_curr_ptr += PadBytes(n * k);
+
+        weight_reduction_ptr = reinterpret_cast<int32_t*>(temp_space_curr_ptr);
+        temp_space_curr_ptr += PadBytes(m * sizeof(int32_t));
+
+        #pragma omp parallel for num_threads(omp_threads)
+        for (index_t i = 0; i < static_cast<index_t>(m); ++i) {
+          weight_reduction_ptr[i] = 0;  // TODO, memset?
+          for (index_t j = 0; j < static_cast<index_t>(k); ++j) {
+            weight_reduction_ptr[i] += weight.dptr_[j];
+          }
+          weight_reduction_ptr[i] *= shift;
+        }
+      }
+    } else {
+      // data x weight(T)
+      if (data_is_int8) {
+        // matrix_a is data, when data is int8_t, need to convert to uint8_t.
+        // Get the buffer for converted data, and do online shifting.
+        shifted_matrix_a_ptr = reinterpret_cast<uint8_t*>(temp_space_curr_ptr);
+        temp_space_curr_ptr += PadBytes(m * k);
+
+        weight_reduction_ptr = reinterpret_cast<int32_t*>(temp_space_curr_ptr);
+        temp_space_curr_ptr += PadBytes(n * sizeof(int32_t));  // size is n here
+
+        #pragma omp parallel for num_threads(omp_threads)
+        for (index_t i = 0; i < static_cast<index_t>(n); ++i) { // size is n here
+          weight_reduction_ptr[i] = 0;  // TODO, memset?
+          for (index_t j = 0; j < static_cast<index_t>(k); ++j) {
+            weight_reduction_ptr[i] += weight.dptr_[j];
+          }
+          weight_reduction_ptr[i] *= shift;
+        }
+      }
+    }
+
+    if (!param_.no_bias) {
       float bias_int32_rescale = data_scale * weight_scale *
-          MaxAbs(*min_bias.dptr_, *max_bias.dptr_) / kInt8Range;
+          MaxAbs(cached_min_bias_, cached_max_bias_) / kInt8Range;
+
+      CHECK(temp_space_curr_ptr);
+      int32_bias_ptr = reinterpret_cast<int32_t*>(temp_space_curr_ptr);
+      temp_space_curr_ptr += PadBytes(bias_size * sizeof(int32_t));
+
       #pragma omp parallel for num_threads(omp_threads)
       for (index_t i = 0; i < static_cast<index_t>(bias_size); ++i) {
         int32_bias_ptr[i] = bias.dptr_[i] * bias_int32_rescale;
       }
 
-      // TODO: cached
-      #pragma omp parallel for num_threads(omp_threads)
-      for (index_t i = 0; i < static_cast<index_t>(m); ++i) {
-        weight_reduction_ptr[i] = 0;
-        for (index_t j = 0; j < static_cast<index_t>(k); ++j) {
-          weight_reduction_ptr[i] += weight.dptr_[j];
+      if (weight_reduction_ptr) {
+        // valid only: (params_.trans_out && !data_is_int8) || (!params_.trans_out && data_is_int8)
+        #pragma omp parallel for num_threads(omp_threads)
+        for (index_t i = 0; i < static_cast<index_t>(bias_size); ++i) {
+          int32_bias_ptr[i] += weight_reduction_ptr[i];
         }
-        int32_bias_ptr[i] = 128 * weight_reduction_ptr[i];
       }
-
-      #pragma omp parallel for num_threads(omp_threads)
-      for (index_t i = 0; i < static_cast<index_t>(n); ++i) {
-        data_reduction_ptr[i] = 0;
-        for (index_t j = 0; j < static_cast<index_t>(k); ++j) {
-          data_reduction_ptr[i] += data.dptr_[j];
-        }
-        data_reduction_ptr[i] *= 128;
-      }
-
-      #pragma omp parallel for num_threads(omp_threads)
-      for (index_t i = 0; i < static_cast<index_t>(m * n); ++i) {
-        output_temp[i] = int32_bias_ptr[i % n] - data_reduction_ptr[i % m];
-      }
-    } else {
-    // out.shape: batchsize x num_hidden
-      Kernel<QuantizedSumInitKernelWithBias, cpu>::Launch(s, bias_size, out.dptr_,
-          bias.dptr_, min_output.dptr_, max_output.dptr_, min_bias.dptr_, max_bias.dptr_);
     }
-  } else {
+
+    initialized_ = true;
+  }
+
+  if (param_.no_bias) {
     #pragma omp parallel for num_threads(omp_threads)
     for (int i = 0; i < m * n; ++i) {
       output_temp[i] = 0;
     }
   }
 
-  if (data_is_int8 && !param.trans_out) {
+  if (param_.trans_out) {
+    // weight x data(T)
+    // out + 128 * weight_reduction - 128 * data_reduction
     #pragma omp parallel for num_threads(omp_threads)
-    for (int i = 0; i < n; ++i) {
-      for (int j = 0; j < k; ++j) {
-        output_temp[i] -= shift * matrix_b[i * k + j];
+    for (index_t i = 0; i < static_cast<index_t>(n); ++i) {
+      data_reduction_ptr[i] = 0; // TODO: memset?
+      for (index_t j = 0; j < static_cast<index_t>(k); ++j) {
+        data_reduction_ptr[i] += data.dptr_[j];
+      }
+      data_reduction_ptr[i] *= shift;
+    }
+
+    if (!data_is_int8) {
+      // matrix_b is data, when data is uint8_t, need to convert to int8_t.
+      #pragma omp parallel for num_threads(omp_threads)
+      for (int i = 0; i < n * k; ++i) {
+        shifted_matrix_b_ptr[i] = data.dptr_[i] - shift;
+      }
+      matrix_b = shifted_matrix_b_ptr;
+
+      auto reduction_ptr = (!param_.no_bias) ? int32_bias_ptr : weight_reduction_ptr;
+      #pragma omp parallel for num_threads(omp_threads)
+      for (index_t i = 0; i < static_cast<index_t>(m * n); ++i) {
+        output_temp[i] = reduction_ptr[i % n] - data_reduction_ptr[i % m];
+      }
+    } else {
+      matrix_b = reinterpret_cast<int8_t *>(data.dptr_);
+
+      #pragma omp parallel for num_threads(omp_threads)
+      for (index_t i = 0; i < static_cast<index_t>(m * n); ++i) {
+        output_temp[i] -= data_reduction_ptr[i % m];
       }
     }
-    #pragma omp parallel for num_threads(omp_threads)
-    for (int i = n; i < m * n; ++i) {
-      output_temp[i] = output_temp[i % n];
+  } else {
+    if (data_is_int8) {
+      #pragma omp parallel for num_threads(omp_threads)
+      for (int i = 0; i < m * k; ++i) {
+        shifted_matrix_a_ptr[i] = matrix_a[i] + shift;
+      }
+
+      #pragma omp parallel for num_threads(omp_threads)
+      for (int i = 0; i < n; ++i) {
+        for (int j = 0; j < k; ++j) {
+          output_temp[i] -= shift * matrix_b[i * k + j];
+        }
+      }
+      #pragma omp parallel for num_threads(omp_threads)
+      for (int i = n; i < m * n; ++i) {
+        output_temp[i] = output_temp[i % n];
+      }
     }
   }
+
+  min_output.dptr_[0] = cached_min_out_;
+  max_output.dptr_[0] = cached_max_out_;
 
   auto trans_a = CblasNoTrans;
   auto trans_b = CblasTrans;
@@ -387,13 +553,13 @@ void QuantizedFullyConnectedForwardCPU_(const nnvm::NodeAttrs& attrs,
   MKL_INT ldb = k;
   MKL_INT ldc = n;
 
-  if (param.trans_data) {
+  if (param_.trans_data) {
     trans_a = CblasTrans;
     lda = m;
   }
 
-  auto matrix_a_ = (!param.trans_out && !data_is_int8) ? reinterpret_cast<void *>(matrix_a) :
-      reinterpret_cast<void *>(shifted_matrix_a.dptr_);
+  auto matrix_a_ = (!param_.trans_out && !data_is_int8) ? reinterpret_cast<void *>(matrix_a) :
+      reinterpret_cast<void *>(shifted_matrix_a_ptr);
 
   cblas_gemm_s8u8s32(CblasRowMajor,
                      trans_a,
@@ -403,10 +569,10 @@ void QuantizedFullyConnectedForwardCPU_(const nnvm::NodeAttrs& attrs,
                      n,
                      k,
                      alpha,
-                     matrix_a_,
+                     matrix_a_, // alwyas uint8_t*;
                      lda,
                      oa,
-                     matrix_b,
+                     matrix_b,  // always int8_t*
                      ldb,
                      ob,
                      beta,
@@ -420,13 +586,22 @@ void QuantizedFullyConnectedForwardCPU_(const nnvm::NodeAttrs& attrs,
 #endif
 }
 
-void QuantizedFullyConnectedForwardCPU(const nnvm::NodeAttrs& attrs,
-                                       const OpContext &ctx,
-                                       const std::vector<TBlob> &in_data,
-                                       const std::vector<OpReqType> &req,
-                                       const std::vector<TBlob> &out_data) {
+static OpStatePtr CreateQuantizedFullyConnectedState(const nnvm::NodeAttrs &attrs,
+                                                     Context ctx,
+                                                     const mxnet::ShapeVector &in_shapes,
+                                                     const std::vector<int> &in_types) {
+  return OpStatePtr::Create<QuantizedFullyConnectedOp>(attrs);
+}
+
+static void QuantizedFullyConnectedForwardCPU(const OpStatePtr &state,
+                                              const OpContext &ctx,
+                                              const std::vector<TBlob> &in_data,
+                                              const std::vector<OpReqType> &req,
+                                              const std::vector<TBlob> &out_data) {
+  QuantizedFullyConnectedOp &op = state.get_state<QuantizedFullyConnectedOp>();
+
   MXNET_INT8_TYPE_SWITCH(in_data[fullc::kData].type_flag_, DType, {
-    QuantizedFullyConnectedForwardCPU_<DType>(attrs, ctx, in_data, req, out_data);
+    op.Forward<DType>(ctx, in_data, req, out_data);
   });
 }
 
@@ -474,14 +649,16 @@ and max thresholds representing the threholds for quantizing the float32 output 
 .set_attr<mxnet::FInferShape>("FInferShape", QuantizedFullyConnectedShape)
 .set_attr<nnvm::FInferType>("FInferType", QuantizedFullyConnectedType)
 .set_attr<FInferStorageType>("FInferStorageType", QuantizedFullyConnectedStorageType)
+.set_attr<FCreateOpState>("FCreateOpState", CreateQuantizedFullyConnectedState)
+.set_attr<FStatefulCompute>("FStatefulComputeEx<cpu>", QuantizedFullyConnectedForwardCPU)
 // TODO(Xinyu): a temp solution to enable GluonCV INT8 flow,
 // will be reverted after the improvement of CachedOP is done.
 .set_attr<nnvm::FGradient>("FGradient", MakeZeroGradNodes)
 .set_attr<FNeedRequantize>("FNeedRequantize", [](const NodeAttrs& attrs) { return true; })
-.set_attr<FCompute>("FCompute<cpu>", QuantizedFullyConnectedForwardCPU)
+//.set_attr<FCompute>("FCompute<cpu>", QuantizedFullyConnectedForwardCPU)
 #if MXNET_USE_MKLDNN == 1
-.set_attr<bool>("TIsMKLDNN", true)
-.set_attr<FComputeEx>("FComputeEx<cpu>", QuantizedFullyConnectedForwardExCPU)
+//.set_attr<bool>("TIsMKLDNN", true)
+//.set_attr<FComputeEx>("FComputeEx<cpu>", QuantizedFullyConnectedForwardExCPU)
 #endif
 .set_attr<FResourceRequest>("FResourceRequest",
   [](const NodeAttrs& attrs) {
