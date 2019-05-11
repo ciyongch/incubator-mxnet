@@ -44,7 +44,7 @@ class QuantizedFullyConnectedOp {
     : initialized_(false),
       param_(nnvm::get<FullyConnectedParam>(attrs.parsed)) {}
 
-  template<typename DType>
+  template<typename SrcDType, typename DstDType>
   void Forward(const OpContext &ctx,
                const std::vector<TBlob> &inputs,
                const std::vector<OpReqType> &req,
@@ -84,6 +84,8 @@ class QuantizedFullyConnectedOp {
   int32_t* data_reduction_ptr = nullptr;
   int32_t* int32_bias_ptr = nullptr;
   int32_t* weight_reduction_ptr = nullptr;
+  int32_t* output_temp = nullptr;
+  float cached_scale_;
 };
 
 bool QuantizedFullyConnectedShape(const nnvm::NodeAttrs& attrs,
@@ -93,7 +95,11 @@ bool QuantizedFullyConnectedShape(const nnvm::NodeAttrs& attrs,
   using namespace mshadow;
   uint32_t num_inputs = param.no_bias ? 2 : 3;
   CHECK_EQ(in_shape->size(), num_inputs * 3);
-  CHECK_EQ(out_shape->size(), 3U);
+  if (param.fuse_dequantize) {
+    CHECK_EQ(out_shape->size(), 1U);
+  } else {
+    CHECK_EQ(out_shape->size(), 3U);
+  }
 
   CHECK(shape_is_known(in_shape->at(0)))
     << "QuantizedFullyConnectedOp input data shape must be given";
@@ -139,8 +145,10 @@ bool QuantizedFullyConnectedShape(const nnvm::NodeAttrs& attrs,
     SHAPE_ASSIGN_CHECK(*out_shape, 0, Shape2(param.num_hidden, dshape[0]));
   }
 
-  SHAPE_ASSIGN_CHECK(*out_shape, 1, mxnet::TShape(1, 1));
-  SHAPE_ASSIGN_CHECK(*out_shape, 2, mxnet::TShape(1, 1));
+  if (!param.fuse_dequantize) {
+    SHAPE_ASSIGN_CHECK(*out_shape, 1, mxnet::TShape(1, 1));
+    SHAPE_ASSIGN_CHECK(*out_shape, 2, mxnet::TShape(1, 1));
+  }
   return true;
 }
 
@@ -150,7 +158,11 @@ bool QuantizedFullyConnectedType(const nnvm::NodeAttrs& attrs,
   const FullyConnectedParam& param = nnvm::get<FullyConnectedParam>(attrs.parsed);
   uint32_t num_inputs = param.no_bias ? 2 : 3;
   CHECK_EQ(in_type->size(), num_inputs * 3);
-  CHECK_EQ(out_type->size(), 3U);
+  if (param.fuse_dequantize) {
+    CHECK_EQ(out_type->size(), 1U);
+  } else {
+    CHECK_EQ(out_type->size(), 3U);
+  }
 
 #if MXNET_USE_MKLDNN == 1
   CHECK(in_type->at(0) == mshadow::kInt8 || in_type->at(0) == mshadow::kUint8)
@@ -166,9 +178,13 @@ bool QuantizedFullyConnectedType(const nnvm::NodeAttrs& attrs,
     TYPE_ASSIGN_CHECK(*in_type, i, mshadow::kFloat32);
   }
 
-  TYPE_ASSIGN_CHECK(*out_type, 0, mshadow::kInt32);
-  TYPE_ASSIGN_CHECK(*out_type, 1, mshadow::kFloat32);
-  TYPE_ASSIGN_CHECK(*out_type, 2, mshadow::kFloat32);
+  if (param.fuse_dequantize) {
+    TYPE_ASSIGN_CHECK(*out_type, 0, mshadow::kFloat32);
+  } else {
+    TYPE_ASSIGN_CHECK(*out_type, 0, mshadow::kInt32);
+    TYPE_ASSIGN_CHECK(*out_type, 1, mshadow::kFloat32);
+    TYPE_ASSIGN_CHECK(*out_type, 2, mshadow::kFloat32);
+  }
   return true;
 }
 
@@ -180,7 +196,11 @@ bool QuantizedFullyConnectedStorageType(const nnvm::NodeAttrs& attrs,
   const FullyConnectedParam& param = nnvm::get<FullyConnectedParam>(attrs.parsed);
   uint32_t num_inputs = param.no_bias ? 2 : 3;
   CHECK_EQ(in_attrs->size(), num_inputs * 3);
-  CHECK_EQ(out_attrs->size(), 3U);
+  if (param.fuse_dequantize) {
+    CHECK_EQ(out_attrs->size(), 1U);
+  } else {
+    CHECK_EQ(out_attrs->size(), 3U);
+  }
 
 #if MXNET_USE_MKLDNN == 1
   bool support_mkldnn = true;
@@ -236,7 +256,7 @@ static inline size_t PadBytes(size_t num_bytes, size_t alignment=64) {
   return (num_bytes + (alignment - num_bytes % alignment) % alignment);
 }
 
-template <typename DType>
+template <typename SrcDType, typename DstDType>
 void QuantizedFullyConnectedOp::Forward(const OpContext &ctx,
                                         const std::vector<TBlob> &in_data,
                                         const std::vector<OpReqType> &req,
@@ -247,7 +267,11 @@ void QuantizedFullyConnectedOp::Forward(const OpContext &ctx,
   Stream<cpu> *s = ctx.get_stream<cpu>();
   size_t num_inputs = param_.no_bias ? 2 : 3;
   CHECK_EQ(in_data.size(),  num_inputs * 3);
-  CHECK_EQ(out_data.size(), 3U);
+  if (param_.fuse_dequantize) {
+    CHECK_EQ(out_data.size(), 1U);
+  } else {
+    CHECK_EQ(out_data.size(), 3U);
+  }
 
   const mxnet::TShape &dshape = in_data[fullc::kData].shape_;
   const mxnet::TShape &wshape = in_data[fullc::kWeight].shape_;
@@ -265,15 +289,14 @@ void QuantizedFullyConnectedOp::Forward(const OpContext &ctx,
   if(in_data[fullc::kData].type_flag_ == mshadow::kUint8)
     data_is_int8 = false;
 
-  Tensor<cpu, 2, DType> data = in_data[fullc::kData].get_with_shape<cpu, 2, DType>(
+  Tensor<cpu, 2, SrcDType> data = in_data[fullc::kData].get_with_shape<cpu, 2, SrcDType>(
     Shape2(dshape[0], dshape.ProdShape(1, dshape.ndim())), s);
   Tensor<cpu, 2, int8_t> weight = in_data[fullc::kWeight].get<cpu, 2, int8_t>(s);
-  Tensor<cpu, 2, int32_t> out = out_data[fullc::kOut].get_with_shape<cpu, 2, int32_t>(
+  Tensor<cpu, 2, DstDType> out = out_data[fullc::kOut].get_with_shape<cpu, 2, DstDType>(
     Shape2(oshape[0], oshape.ProdShape(1, oshape.ndim())), s);
 
-  DType* matrix_a = data.dptr_;
+  SrcDType* matrix_a = data.dptr_;
   int8_t* matrix_b = weight.dptr_;
-  int32_t* output_temp = out.dptr_;
   const int omp_threads = mxnet::engine::OpenMP::Get()->GetRecommendedOMPThreadCount();
   const float alpha = 1.0f;
   const float beta  = 1.0f;
@@ -298,8 +321,13 @@ void QuantizedFullyConnectedOp::Forward(const OpContext &ctx,
     n = dshape[0];
   }
 
-  Tensor<cpu, 1, float> min_output = out_data[quantized_fullc::kOutMin].get<cpu, 1, float>(s);
-  Tensor<cpu, 1, float> max_output = out_data[quantized_fullc::kOutMax].get<cpu, 1, float>(s);
+  Tensor<cpu, 1, float> min_output;
+  Tensor<cpu, 1, float> max_output;
+  if (!param_.fuse_dequantize) {
+    output_temp = reinterpret_cast<int32_t*>(out.dptr_);
+    min_output = out_data[quantized_fullc::kOutMin].get<cpu, 1, float>(s);
+    max_output = out_data[quantized_fullc::kOutMax].get<cpu, 1, float>(s);
+  }
   float min_data = (in_data[num_inputs + quantized_fullc::kDataMin].get<cpu, 1, float>(s)).dptr_[0];
   float max_data = (in_data[num_inputs + quantized_fullc::kDataMax].get<cpu, 1, float>(s)).dptr_[0];
   float min_weight =
@@ -325,6 +353,18 @@ void QuantizedFullyConnectedOp::Forward(const OpContext &ctx,
   }
 
   if (!initialized_) {
+    #if DEBUG
+    if (data_is_int8)
+      std::cout << "s8, ";
+    else
+      std::cout << "u8, ";
+
+    if (param_.trans_data)
+      std::cout << "trans + fc, ";
+
+    if (param_.trans_out)
+      std::cout << "fc + trans, ";
+    #endif
     cached_min_data_ = min_data;
     cached_max_data_ = max_data;
     cached_min_weight_ = min_weight;
@@ -337,9 +377,23 @@ void QuantizedFullyConnectedOp::Forward(const OpContext &ctx,
     float data_scale = (data_is_int8 ? kInt8Range : kUint8Range) /
         MaxAbs(cached_min_data_, cached_max_data_);
     float weight_scale = kInt8Range / MaxAbs(cached_min_weight_, cached_max_weight_);
+    cached_scale_ = 1.0 / data_scale / weight_scale;
+    #if DEBUG
+    std::cout << "cached_scale_:" << cached_scale_;
+    std::cout << "\n";
+    #endif
     size_t bias_size = 0;
     size_t temp_space_size = 0;
     Tensor<cpu, 1, int8_t> bias;
+
+    if (param_.fuse_dequantize) {
+      // temp space to store IGEMM int32 output
+      temp_space_size += PadBytes(m * n * sizeof(int32_t));
+    } else {
+      Kernel<QuantizationRangeForMultiplicationStruct, cpu>::Launch(
+          s, 1, &cached_min_out_, &cached_max_out_, &cached_min_data_, &cached_max_data_,
+          &cached_min_weight_, &cached_max_weight_);
+    }
 
     if (!param_.no_bias) {
       bias = in_data[fullc::kBias].get_with_shape<cpu, 1, int8_t>(Shape1(wshape[0]), s);
@@ -348,10 +402,6 @@ void QuantizedFullyConnectedOp::Forward(const OpContext &ctx,
       // rescaled int32_bias
       temp_space_size += PadBytes(bias_size * sizeof(int32_t));
     }
-
-    Kernel<QuantizationRangeForMultiplicationStruct, cpu>::Launch(
-        s, 1, &cached_min_out_, &cached_max_out_, &cached_min_data_, &cached_max_data_,
-        &cached_min_weight_, &cached_max_weight_);
 
     if (param_.trans_out) {
       // shifted_matrix_a
@@ -380,13 +430,6 @@ void QuantizedFullyConnectedOp::Forward(const OpContext &ctx,
     char* temp_space_curr_ptr = nullptr;
     if (temp_space_size > 0) {
       // allocate enough memory for later use
-      // TODO: requested memory buffer will be reused by FW, need to make it unique.
-      /*
-      temp_space_ = ctx.requested[quantized_fc::kTempSpace].get_space_typed<cpu, 1, char>(
-          Shape1(temp_space_size), s);
-
-      temp_space_curr_ptr = temp_space_.dptr_;
-      */
       #if _MSC_VER
         temp_space_ = _reinterprect_cast<char *>(aligned_malloc(temp_space_size, 64));
         if (temp_space_ == nullptr) LOG(FATAL) << "Failed to allocate CPU Memory";
@@ -395,6 +438,11 @@ void QuantizedFullyConnectedOp::Forward(const OpContext &ctx,
         if (ret != 0) LOG(FATAL) << "Failed to allocate CPU Memory";
       #endif
       temp_space_curr_ptr = temp_space_;
+    }
+
+    if (param_.fuse_dequantize) {
+      output_temp = reinterpret_cast<int32_t*>(temp_space_curr_ptr);
+      temp_space_curr_ptr += PadBytes(m * n * sizeof(int32_t));
     }
 
     if (param_.trans_out) {
@@ -536,9 +584,6 @@ void QuantizedFullyConnectedOp::Forward(const OpContext &ctx,
     }
   }
 
-  min_output.dptr_[0] = cached_min_out_;
-  max_output.dptr_[0] = cached_max_out_;
-
   auto trans_a = CblasNoTrans;
   auto trans_b = CblasTrans;
   MKL_INT lda = k;
@@ -571,6 +616,16 @@ void QuantizedFullyConnectedOp::Forward(const OpContext &ctx,
                      output_temp,
                      ldc,
                      &oc);
+
+  if (param_.fuse_dequantize) {
+    #pragma omp parallel for num_threads(omp_threads)
+    for (int i = 0; i < m * n; ++i) {
+      out.dptr_[i] = output_temp[i] * cached_scale_;
+    }
+  } else {
+    min_output.dptr_[0] = cached_min_out_;
+    max_output.dptr_[0] = cached_max_out_;
+  }
 #else
   LOG(FATAL) << "Quantized fully connected operator relies on cblas_gemm_s8u8s32"
              << " which is only supported by MKL BLAS."
@@ -592,8 +647,10 @@ static void QuantizedFullyConnectedForwardCPU(const OpStatePtr &state,
                                               const std::vector<TBlob> &out_data) {
   QuantizedFullyConnectedOp &op = state.get_state<QuantizedFullyConnectedOp>();
 
-  MXNET_INT8_TYPE_SWITCH(in_data[fullc::kData].type_flag_, DType, {
-    op.Forward<DType>(ctx, in_data, req, out_data);
+  MXNET_INT8_TYPE_SWITCH(in_data[fullc::kData].type_flag_, SrcDType, {
+    MSHADOW_TYPE_SWITCH(out_data[fullc::kOut].type_flag_, DstDType, {
+      op.Forward<SrcDType, DstDType>(ctx, in_data, req, out_data);
+    });
   });
 }
 
@@ -621,8 +678,13 @@ and max thresholds representing the threholds for quantizing the float32 output 
     const FullyConnectedParam& param = nnvm::get<FullyConnectedParam>(attrs.parsed);
     return param.no_bias? 6 : 9;
   })
-.set_num_outputs(3)
+.set_num_outputs(
+  [](const NodeAttrs& attrs) {
+    const FullyConnectedParam& param = nnvm::get<FullyConnectedParam>(attrs.parsed);
+    return param.fuse_dequantize ? 1 : 3;
+  })
 .set_attr_parser(ParamParser<FullyConnectedParam>)
+
 .set_attr<nnvm::FListInputNames>("FListInputNames",
   [](const NodeAttrs& attrs) {
     const FullyConnectedParam& param = nnvm::get<FullyConnectedParam>(attrs.parsed);
@@ -636,7 +698,11 @@ and max thresholds representing the threholds for quantizing the float32 output 
   })
 .set_attr<nnvm::FListOutputNames>("FListOutputNames",
   [](const NodeAttrs& attrs) {
-    return std::vector<std::string>{"output", "min_output", "max_output"};
+    const FullyConnectedParam& param = nnvm::get<FullyConnectedParam>(attrs.parsed);
+    if (param.fuse_dequantize)
+      return std::vector<std::string>{"output"};
+    else
+      return std::vector<std::string>{"output", "min_output", "max_output"};
   })
 .set_attr<mxnet::FInferShape>("FInferShape", QuantizedFullyConnectedShape)
 .set_attr<nnvm::FInferType>("FInferType", QuantizedFullyConnectedType)

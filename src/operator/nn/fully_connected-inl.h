@@ -60,6 +60,7 @@ struct FullyConnectedParam : public dmlc::Parameter<FullyConnectedParam> {
   bool flatten;
   bool trans_data;
   bool trans_out;
+  bool fuse_dequantize;
   DMLC_DECLARE_PARAMETER(FullyConnectedParam) {
     // TODO(bing) add support for boolean
     DMLC_DECLARE_FIELD(num_hidden).set_lower_bound(1)
@@ -72,6 +73,8 @@ struct FullyConnectedParam : public dmlc::Parameter<FullyConnectedParam> {
     .describe("Whether to transpose the input data tensor.");
     DMLC_DECLARE_FIELD(trans_out).set_default(false)
     .describe("Whether to transpose the output data tensor.");
+    DMLC_DECLARE_FIELD(fuse_dequantize).set_default(false)
+    .describe("Whether to fuse the dequantize.");
   }
   bool operator==(const FullyConnectedParam& other) const {
     return this->num_hidden == other.num_hidden &&
