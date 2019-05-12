@@ -96,6 +96,8 @@ class SgQFCSelector : public SubgraphSelector {
     switch (status) {
       case kStart:
         if (new_node.op() == Op::Get("_contrib_requantize")) {
+          #if 0
+          // fuse + requantize + dequantize
           auto const &param = nnvm::get<RequantizeParam>(new_node.attrs.parsed);
           if (param.min_calib_range.has_value() &&
               param.max_calib_range.has_value()) {
@@ -103,6 +105,10 @@ class SgQFCSelector : public SubgraphSelector {
             status = kRequantize;
             return true;
           }
+          #endif
+          matched_list.push_back(&new_node);
+          status = kRequantize;
+          return true;
         }
       case kRequantize:
         if ((!disable_float_output) && (new_node.op() == Op::Get("_contrib_dequantize"))) {
@@ -168,10 +174,12 @@ class SgQFCQuantizeProperty: public SubgraphProperty {
 
     CHECK_NOTNULL(fc_node);
     CHECK_NOTNULL(requantize_node);
+    #if 0
     auto const &requantize_param =
         nnvm::get<RequantizeParam>(requantize_node->attrs.parsed);
     CHECK(requantize_param.min_calib_range.has_value());
     CHECK(requantize_param.max_calib_range.has_value());
+    #endif
 
     // When only fused quantized_fullyconnected and requantize, set min/max_cablib_range,
     // When fused quantized_fullyconnected + requantize + dequantize, set dequantize flag to true.

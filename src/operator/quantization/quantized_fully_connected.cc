@@ -34,6 +34,8 @@
 namespace mxnet {
 namespace op {
 
+#define ALIGNMENT_BYTES 64
+
 namespace quantized_fc {
 enum QuantizedfcOpResource {kTempSpace};
 }
@@ -59,11 +61,14 @@ class QuantizedFullyConnectedOp {
   }
 
   ~QuantizedFullyConnectedOp() {
-   #if _MSC_VER
-     _aligned_free(temp_space_);
-   #else
-     free(temp_space_);
-   #endif
+    if (temp_space_) {
+     #if _MSC_VER
+       _aligned_free(temp_space_);
+     #else
+       free(temp_space_);
+     #endif
+        temp_space_ = nullptr;
+    }
   }
 
  private:
@@ -78,14 +83,14 @@ class QuantizedFullyConnectedOp {
   float cached_min_out_;
   float cached_max_out_;
   //Tensor<cpu, 1, char> temp_space_;
-  char * temp_space_;
+  char * temp_space_ = nullptr;
   uint8_t* shifted_matrix_a_ptr = nullptr;
   int8_t* shifted_matrix_b_ptr = nullptr;
-  int32_t* data_reduction_ptr = nullptr;
+  int32_t* matrix_a_reduction_ptr = nullptr;
+  int32_t* matrix_b_reduction_ptr = nullptr;
   int32_t* int32_bias_ptr = nullptr;
-  int32_t* weight_reduction_ptr = nullptr;
-  int32_t* output_temp = nullptr;
   float cached_scale_;
+  int32_t* output_temp = nullptr;
 };
 
 bool QuantizedFullyConnectedShape(const nnvm::NodeAttrs& attrs,
@@ -252,7 +257,7 @@ struct QuantizedSumInitKernelWithBias {
   }
 };
 
-static inline size_t PadBytes(size_t num_bytes, size_t alignment=64) {
+static inline size_t PadBytes(size_t num_bytes, size_t alignment=ALIGNMENT_BYTES) {
   return (num_bytes + (alignment - num_bytes % alignment) % alignment);
 }
 
@@ -295,8 +300,8 @@ void QuantizedFullyConnectedOp::Forward(const OpContext &ctx,
   Tensor<cpu, 2, DstDType> out = out_data[fullc::kOut].get_with_shape<cpu, 2, DstDType>(
     Shape2(oshape[0], oshape.ProdShape(1, oshape.ndim())), s);
 
-  SrcDType* matrix_a = data.dptr_;
-  int8_t* matrix_b = weight.dptr_;
+  uint8_t* matrix_a_ptr = nullptr;
+  int8_t* matrix_b_ptr = nullptr;
   const int omp_threads = mxnet::engine::OpenMP::Get()->GetRecommendedOMPThreadCount();
   const float alpha = 1.0f;
   const float beta  = 1.0f;
@@ -307,7 +312,6 @@ void QuantizedFullyConnectedOp::Forward(const OpContext &ctx,
   int m = dshape[0], n = wshape[0], k = dshape.ProdShape(1, dshape.ndim());
 
   //  cblas_gemm_s8u8s32 required first matrix must be uint8
-  //  shift data from int8(from -128 to 127) to uint8 (from 0 to 255)
   int shift = 128;
 
   if (param_.trans_data) {
@@ -321,27 +325,28 @@ void QuantizedFullyConnectedOp::Forward(const OpContext &ctx,
     n = dshape[0];
   }
 
-  Tensor<cpu, 1, float> min_output;
-  Tensor<cpu, 1, float> max_output;
-  if (!param_.fuse_dequantize) {
-    output_temp = reinterpret_cast<int32_t*>(out.dptr_);
-    min_output = out_data[quantized_fullc::kOutMin].get<cpu, 1, float>(s);
-    max_output = out_data[quantized_fullc::kOutMax].get<cpu, 1, float>(s);
-  }
   float min_data = (in_data[num_inputs + quantized_fullc::kDataMin].get<cpu, 1, float>(s)).dptr_[0];
   float max_data = (in_data[num_inputs + quantized_fullc::kDataMax].get<cpu, 1, float>(s)).dptr_[0];
   float min_weight =
     (in_data[num_inputs + quantized_fullc::kWeightMin].get<cpu, 1, float>(s)).dptr_[0];
   float max_weight =
     (in_data[num_inputs + quantized_fullc::kWeightMax].get<cpu, 1, float>(s)).dptr_[0];
+
   float min_bias = 0.0;
   float max_bias = 0.0;
-
   if (!param_.no_bias) {
     min_bias =
       (in_data[num_inputs + quantized_fullc::kBiasMin].get<cpu, 1, float>(s)).dptr_[0];
     max_bias =
       (in_data[num_inputs + quantized_fullc::kBiasMax].get<cpu, 1, float>(s)).dptr_[0];
+  }
+
+  float* min_output_ptr = nullptr;
+  float* max_output_ptr = nullptr;
+  if (!param_.fuse_dequantize) {
+    output_temp = reinterpret_cast<int32_t*>(out.dptr_);
+    min_output_ptr = (out_data[quantized_fullc::kOutMin].get<cpu, 1, float>(s)).dptr_;
+    max_output_ptr = (out_data[quantized_fullc::kOutMax].get<cpu, 1, float>(s)).dptr_;
   }
 
   if (initialized_) {
@@ -353,18 +358,6 @@ void QuantizedFullyConnectedOp::Forward(const OpContext &ctx,
   }
 
   if (!initialized_) {
-    #if DEBUG
-    if (data_is_int8)
-      std::cout << "s8, ";
-    else
-      std::cout << "u8, ";
-
-    if (param_.trans_data)
-      std::cout << "trans + fc, ";
-
-    if (param_.trans_out)
-      std::cout << "fc + trans, ";
-    #endif
     cached_min_data_ = min_data;
     cached_max_data_ = max_data;
     cached_min_weight_ = min_weight;
@@ -378,13 +371,9 @@ void QuantizedFullyConnectedOp::Forward(const OpContext &ctx,
         MaxAbs(cached_min_data_, cached_max_data_);
     float weight_scale = kInt8Range / MaxAbs(cached_min_weight_, cached_max_weight_);
     cached_scale_ = 1.0 / data_scale / weight_scale;
-    #if DEBUG
-    std::cout << "cached_scale_:" << cached_scale_;
-    std::cout << "\n";
-    #endif
+
     size_t bias_size = 0;
     size_t temp_space_size = 0;
-    Tensor<cpu, 1, int8_t> bias;
 
     if (param_.fuse_dequantize) {
       // temp space to store IGEMM int32 output
@@ -396,114 +385,112 @@ void QuantizedFullyConnectedOp::Forward(const OpContext &ctx,
     }
 
     if (!param_.no_bias) {
-      bias = in_data[fullc::kBias].get_with_shape<cpu, 1, int8_t>(Shape1(wshape[0]), s);
-
       bias_size = wshape[0];
       // rescaled int32_bias
       temp_space_size += PadBytes(bias_size * sizeof(int32_t));
     }
 
-    if (param_.trans_out) {
+    if (param_.trans_out || data_is_int8) {
       // shifted_matrix_a
       temp_space_size += PadBytes(m * k);
-
-      // data(matrix_b) reduction
+      // matrix_b reduction
       temp_space_size += PadBytes(n * sizeof(int32_t));
+    }
 
-      if (!data_is_int8) {
-        // shifed_matrix_b
-        temp_space_size += PadBytes(n * k);
-
-        // weight(matrix_a) reduction
-        temp_space_size += PadBytes(m * sizeof(int32_t));
-      }
-    } else {
-      if (data_is_int8) {
-        // shifted_matrix_a
-        temp_space_size += PadBytes(m * k);
-
-        // weight(matrix_b) reduction
-        temp_space_size += PadBytes(n * sizeof(int32_t));
-      }
+    if (param_.trans_out && !data_is_int8) {
+      // shifed_matrix_b
+      temp_space_size += PadBytes(n * k);
+      // matrix_a reduction
+      temp_space_size += PadBytes(m * sizeof(int32_t));
     }
 
     char* temp_space_curr_ptr = nullptr;
     if (temp_space_size > 0) {
       // allocate enough memory for later use
       #if _MSC_VER
-        temp_space_ = _reinterprect_cast<char *>(aligned_malloc(temp_space_size, 64));
+        temp_space_ = reinterpret_cast<char *>(aligned_malloc(temp_space_size, ALIGNMENT_BYTES));
         if (temp_space_ == nullptr) LOG(FATAL) << "Failed to allocate CPU Memory";
       #else
-        int ret = posix_memalign(reinterpret_cast<void **>(&temp_space_), 64, temp_space_size);
+        int ret = posix_memalign(reinterpret_cast<void **>(&temp_space_),
+            ALIGNMENT_BYTES, temp_space_size);
         if (ret != 0) LOG(FATAL) << "Failed to allocate CPU Memory";
       #endif
       temp_space_curr_ptr = temp_space_;
     }
 
     if (param_.fuse_dequantize) {
+      auto temp_size = PadBytes(m * n * sizeof(int32_t));
+      CHECK(temp_space_ && temp_space_curr_ptr &&
+        ((temp_space_curr_ptr + temp_size) <= (temp_space_ + temp_space_size)));
+
       output_temp = reinterpret_cast<int32_t*>(temp_space_curr_ptr);
-      temp_space_curr_ptr += PadBytes(m * n * sizeof(int32_t));
+      temp_space_curr_ptr += temp_size;
     }
 
-    if (param_.trans_out) {
-      // weight x data(T)
-      // matrix_a is weight, need to convert it from int8_t to uint8_t.
+    if (param_.trans_out || data_is_int8) {
+      auto temp_size = PadBytes(m * k) + PadBytes(n * sizeof(int32_t));
+      CHECK(temp_space_ && temp_space_curr_ptr &&
+        ((temp_space_curr_ptr + temp_size) <= (temp_space_ + temp_space_size)));
+
       shifted_matrix_a_ptr = reinterpret_cast<uint8_t*>(temp_space_curr_ptr);
       temp_space_curr_ptr += PadBytes(m * k);
 
-      #pragma omp parallel for num_threads(omp_threads)
-      for (index_t i = 0; i < static_cast<index_t>(m * k); ++i) {
-        shifted_matrix_a_ptr[i] = weight.dptr_[i] + shift;
-      }
-
-      data_reduction_ptr = reinterpret_cast<int32_t*>(temp_space_curr_ptr);
+      matrix_b_reduction_ptr = reinterpret_cast<int32_t*>(temp_space_curr_ptr);
       temp_space_curr_ptr += PadBytes(n * sizeof(int32_t));
 
-      if (!data_is_int8) {
-        // matrix_b is data, when data is uint8_t, need to convert to int8_t.
-        // Get the buffer for converted data, and do online shifting.
-        shifted_matrix_b_ptr = reinterpret_cast<int8_t*>(temp_space_curr_ptr);
-        temp_space_curr_ptr += PadBytes(n * k);
-
-        weight_reduction_ptr = reinterpret_cast<int32_t*>(temp_space_curr_ptr);
-        temp_space_curr_ptr += PadBytes(m * sizeof(int32_t));
-
+      if (param_.trans_out) {
+        // weight x data(T), shift weight to uint8, data_reduction will be calculated online
         #pragma omp parallel for num_threads(omp_threads)
-        for (index_t i = 0; i < static_cast<index_t>(m); ++i) {
-          weight_reduction_ptr[i] = 0;  // TODO, memset?
-          for (index_t j = 0; j < static_cast<index_t>(k); ++j) {
-            weight_reduction_ptr[i] += weight.dptr_[j];
-          }
-          weight_reduction_ptr[i] *= shift;
+        for (index_t i = 0; i < static_cast<index_t>(m * k); ++i) {
+          shifted_matrix_a_ptr[i] = weight.dptr_[i] + shift;
         }
-      }
-    } else {
-      // data x weight(T)
-      if (data_is_int8) {
-        // matrix_a is data, when data is int8_t, need to convert to uint8_t.
-        // Get the buffer for converted data, and do online shifting.
-        shifted_matrix_a_ptr = reinterpret_cast<uint8_t*>(temp_space_curr_ptr);
-        temp_space_curr_ptr += PadBytes(m * k);
-
-        weight_reduction_ptr = reinterpret_cast<int32_t*>(temp_space_curr_ptr);
-        temp_space_curr_ptr += PadBytes(n * sizeof(int32_t));  // size is n here
-
+      } else {
+        // data x weight(T), data is int8, will be shifted to uint8 online,
+        // but we can calculate weight_reduction here for only once
         #pragma omp parallel for num_threads(omp_threads)
         for (index_t i = 0; i < static_cast<index_t>(n); ++i) { // size is n here
-          weight_reduction_ptr[i] = 0;  // TODO, memset?
+          matrix_b_reduction_ptr[i] = 0;  // TODO, memset?
           for (index_t j = 0; j < static_cast<index_t>(k); ++j) {
-            weight_reduction_ptr[i] += weight.dptr_[j];
+            matrix_b_reduction_ptr[i] -= weight.dptr_[i * k + j]; // minus weight
           }
-          weight_reduction_ptr[i] *= shift;
+          matrix_b_reduction_ptr[i] *= shift;
         }
+      }
+    }
+
+    if (param_.trans_out && !data_is_int8) {
+      // weight x data(T), data is uint8, need to shift to int8 online, and calculated
+      // weight reduction here for only once
+      auto temp_size = PadBytes(n * k) + PadBytes(m * sizeof(int32_t));
+      CHECK(temp_space_ && temp_space_curr_ptr &&
+        ((temp_space_curr_ptr + temp_size) <= (temp_space_ + temp_space_size)));
+
+      shifted_matrix_b_ptr = reinterpret_cast<int8_t*>(temp_space_curr_ptr);
+      temp_space_curr_ptr += PadBytes(n * k);
+
+      matrix_a_reduction_ptr = reinterpret_cast<int32_t*>(temp_space_curr_ptr);
+      temp_space_curr_ptr += PadBytes(m * sizeof(int32_t));
+
+      #pragma omp parallel for num_threads(omp_threads)
+      for (index_t i = 0; i < static_cast<index_t>(m); ++i) {
+        matrix_a_reduction_ptr[i] = 0;  // TODO, memset?
+        for (index_t j = 0; j < static_cast<index_t>(k); ++j) {
+          matrix_a_reduction_ptr[i] += weight.dptr_[i * k + j] + shift; // plus weight
+        }
+        matrix_a_reduction_ptr[i] *= shift;
       }
     }
 
     if (!param_.no_bias) {
+      Tensor<cpu, 1, int8_t> bias =
+        in_data[fullc::kBias].get_with_shape<cpu, 1, int8_t>(Shape1(wshape[0]), s);
+
       float bias_int32_rescale = data_scale * weight_scale *
           MaxAbs(cached_min_bias_, cached_max_bias_) / kInt8Range;
 
-      CHECK(temp_space_curr_ptr);
+      auto temp_size = PadBytes(bias_size * sizeof(int32_t));
+      CHECK(temp_space_ && temp_space_curr_ptr &&
+        ((temp_space_curr_ptr + temp_size) <= (temp_space_ + temp_space_size)));
       int32_bias_ptr = reinterpret_cast<int32_t*>(temp_space_curr_ptr);
       temp_space_curr_ptr += PadBytes(bias_size * sizeof(int32_t));
 
@@ -512,11 +499,16 @@ void QuantizedFullyConnectedOp::Forward(const OpContext &ctx,
         int32_bias_ptr[i] = bias.dptr_[i] * bias_int32_rescale;
       }
 
-      if (weight_reduction_ptr) {
-        // valid only: (params_.trans_out && !data_is_int8) || (!params_.trans_out && data_is_int8)
+      if (!param_.trans_out && data_is_int8) {
         #pragma omp parallel for num_threads(omp_threads)
         for (index_t i = 0; i < static_cast<index_t>(bias_size); ++i) {
-          int32_bias_ptr[i] += weight_reduction_ptr[i];
+          int32_bias_ptr[i] += matrix_b_reduction_ptr[i];
+        }
+      }
+      if (param_.trans_out && !data_is_int8) {
+        #pragma omp parallel for num_threads(omp_threads)
+        for (index_t i = 0; i < static_cast<index_t>(bias_size); ++i) {
+          int32_bias_ptr[i] += matrix_a_reduction_ptr[i];
         }
       }
     }
@@ -531,55 +523,101 @@ void QuantizedFullyConnectedOp::Forward(const OpContext &ctx,
     }
   }
 
-  if (param_.trans_out) {
-    // weight x data(T)
-    // out + 128 * weight_reduction - 128 * data_reduction
-    #pragma omp parallel for num_threads(omp_threads)
-    for (index_t i = 0; i < static_cast<index_t>(n); ++i) {
-      data_reduction_ptr[i] = 0; // TODO: memset?
-      for (index_t j = 0; j < static_cast<index_t>(k); ++j) {
-        data_reduction_ptr[i] += data.dptr_[j];
-      }
-      data_reduction_ptr[i] *= shift;
-    }
-
-    if (!data_is_int8) {
-      // matrix_b is data, when data is uint8_t, need to convert to int8_t.
+  if (param_.trans_out || data_is_int8) {
+    // shift matrix a, do reduction to matrix b
+    if (param_.trans_out) {
+      // weight x data(T)
+      // weight already be shifted during initialization, need to reduce data here
       #pragma omp parallel for num_threads(omp_threads)
-      for (int i = 0; i < n * k; ++i) {
-        shifted_matrix_b_ptr[i] = data.dptr_[i] - shift;
-      }
-      matrix_b = shifted_matrix_b_ptr;
-
-      auto reduction_ptr = (!param_.no_bias) ? int32_bias_ptr : weight_reduction_ptr;
-      #pragma omp parallel for num_threads(omp_threads)
-      for (index_t i = 0; i < static_cast<index_t>(m * n); ++i) {
-        output_temp[i] = reduction_ptr[i % n] - data_reduction_ptr[i % m];
+      for (index_t i = 0; i < static_cast<index_t>(n); ++i) {
+        matrix_b_reduction_ptr[i] = 0; // TODO: memset?
+        for (index_t j = 0; j < static_cast<index_t>(k); ++j) {
+          matrix_b_reduction_ptr[i] -= data.dptr_[i * k + j];
+        }
+        matrix_b_reduction_ptr[i] *= shift;
       }
     } else {
-      matrix_b = reinterpret_cast<int8_t *>(data.dptr_);
-
+      // data x weight(T)
+      // data is int8, need to shift data here, weight already be reduced during initialization
       #pragma omp parallel for num_threads(omp_threads)
-      for (index_t i = 0; i < static_cast<index_t>(m * n); ++i) {
-        output_temp[i] -= data_reduction_ptr[i % m];
+      for (int i = 0; i < m * k; ++i) {
+        shifted_matrix_a_ptr[i] = data.dptr_[i] + shift;
+      }
+    }
+  }
+
+  if (param_.trans_out && !data_is_int8) {
+    // weight x data(T)
+    // shift matrix a, do reduction to matrix b
+    // shift matrix b, do reduction to matrix a
+    // weight shift and reduction is already done during initialization, and data reduction is
+    // done in above step. Only need to do data shift here.
+    #pragma omp parallel for num_threads(omp_threads)
+    for (int i = 0; i < n * k; ++i) {
+      shifted_matrix_b_ptr[i] = data.dptr_[i] - shift;
+    }
+  }
+
+  if (param_.trans_out) {
+    // weight x data(T)
+    if (data_is_int8) {
+      // data is int8, then shift weight, and data reduction
+      matrix_a_ptr = reinterpret_cast<uint8_t*>(shifted_matrix_a_ptr);
+      matrix_b_ptr = reinterpret_cast<int8_t*>(data.dptr_);
+
+      if (param_.no_bias) {
+        #pragma omp parallel for num_threads(omp_threads)
+        for (index_t i = 0; i < static_cast<index_t>(m * n); ++i) {
+          output_temp[i] = matrix_b_reduction_ptr[i % n];
+        }
+      } else {
+        #pragma omp parallel for num_threads(omp_threads)
+        for (index_t i = 0; i < static_cast<index_t>(m); ++i) {
+          for (index_t j = 0; j < static_cast<index_t>(n); ++j) {
+            output_temp[i * n + j] = int32_bias_ptr[i] + matrix_b_reduction_ptr[j];
+          }
+        }
+      }
+    } else {
+      // data is uint8, both weight and data need shift and reduction
+      matrix_a_ptr = reinterpret_cast<uint8_t*>(shifted_matrix_a_ptr);
+      matrix_b_ptr = reinterpret_cast<int8_t*>(shifted_matrix_b_ptr);
+
+      auto reduction_ptr = (!param_.no_bias) ? int32_bias_ptr : matrix_a_reduction_ptr;
+      #pragma omp parallel for num_threads(omp_threads)
+      for (index_t i = 0; i < static_cast<index_t>(m); ++i) {
+        for (index_t j = 0; j < static_cast<index_t>(n); ++j) {
+          output_temp[i * n + j] = reduction_ptr[i] + matrix_b_reduction_ptr[j];
+        }
       }
     }
   } else {
+    // data x weight(T)
     if (data_is_int8) {
-      #pragma omp parallel for num_threads(omp_threads)
-      for (int i = 0; i < m * k; ++i) {
-        shifted_matrix_a_ptr[i] = matrix_a[i] + shift;
-      }
+      // data is int8, then shift data, and weight reduction.
+      matrix_a_ptr = reinterpret_cast<uint8_t*>(shifted_matrix_a_ptr);
+      matrix_b_ptr = reinterpret_cast<int8_t*>(weight.dptr_);
 
+      auto reduction_ptr = (!param_.no_bias) ? int32_bias_ptr : matrix_b_reduction_ptr;
       #pragma omp parallel for num_threads(omp_threads)
-      for (int i = 0; i < n; ++i) {
-        for (int j = 0; j < k; ++j) {
-          output_temp[i] -= shift * matrix_b[i * k + j];
+      for (index_t i = 0; i < static_cast<index_t>(m); ++i) {
+        for (index_t j = 0; j < static_cast<index_t>(n); ++j) {
+          output_temp[i * n + j] = reduction_ptr[j];
         }
       }
-      #pragma omp parallel for num_threads(omp_threads)
-      for (int i = n; i < m * n; ++i) {
-        output_temp[i] = output_temp[i % n];
+
+    } else {
+      // data is uint8, no shift and reduction is needed.
+      matrix_a_ptr = reinterpret_cast<uint8_t*>(data.dptr_);
+      matrix_b_ptr = reinterpret_cast<int8_t*>(weight.dptr_);
+
+      if (!param_.no_bias) {
+        #pragma omp parallel for num_threads(omp_threads)
+        for (index_t i = 0; i < static_cast<index_t>(m); ++i) {
+          for (index_t j = 0; j < static_cast<index_t>(n); ++j) {
+            output_temp[i * n + j] = int32_bias_ptr[j];
+          }
+        }
       }
     }
   }
@@ -595,9 +633,6 @@ void QuantizedFullyConnectedOp::Forward(const OpContext &ctx,
     lda = m;
   }
 
-  auto matrix_a_ = (!param_.trans_out && !data_is_int8) ? reinterpret_cast<void *>(matrix_a) :
-      reinterpret_cast<void *>(shifted_matrix_a_ptr);
-
   cblas_gemm_s8u8s32(CblasRowMajor,
                      trans_a,
                      trans_b,
@@ -606,10 +641,10 @@ void QuantizedFullyConnectedOp::Forward(const OpContext &ctx,
                      n,
                      k,
                      alpha,
-                     matrix_a_, // alwyas uint8_t*;
+                     matrix_a_ptr,
                      lda,
                      oa,
-                     matrix_b,  // always int8_t*
+                     matrix_b_ptr,
                      ldb,
                      ob,
                      beta,
@@ -620,11 +655,11 @@ void QuantizedFullyConnectedOp::Forward(const OpContext &ctx,
   if (param_.fuse_dequantize) {
     #pragma omp parallel for num_threads(omp_threads)
     for (int i = 0; i < m * n; ++i) {
-      out.dptr_[i] = output_temp[i] * cached_scale_;
+      out.dptr_[i] = static_cast<float>(output_temp[i]) * cached_scale_;
     }
   } else {
-    min_output.dptr_[0] = cached_min_out_;
-    max_output.dptr_[0] = cached_max_out_;
+    *min_output_ptr = cached_min_out_;
+    *max_output_ptr = cached_max_out_;
   }
 #else
   LOG(FATAL) << "Quantized fully connected operator relies on cblas_gemm_s8u8s32"
