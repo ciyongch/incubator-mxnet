@@ -106,23 +106,16 @@ void FCForward(const OpContext &ctx, const FullyConnectedParam &param,
 
   Tensor<xpu, 2, DType> wmat = in_data[fullc::kWeight].get<xpu, 2, DType>(s);
   Tensor<xpu, 2, DType> data, out;
-  if (!param.trans_data) {
-    if (!param.flatten) {
-      data = in_data[fullc::kData].get_with_shape<xpu, 2, DType>(
-          Shape2(ishape.ProdShape(0, ishape.ndim()-1), ishape[ishape.ndim()-1]), s);
-      out = out_data[fullc::kOut].get_with_shape<xpu, 2, DType>(
-          Shape2(oshape.ProdShape(0, oshape.ndim()-1), oshape[oshape.ndim()-1]), s);
-    } else {
-      data = in_data[fullc::kData].get_with_shape<xpu, 2, DType>(
-          Shape2(ishape[0], ishape.ProdShape(1, ishape.ndim())), s);
-      out = out_data[fullc::kOut].get_with_shape<xpu, 2, DType>(
-          Shape2(oshape[0], oshape.ProdShape(1, oshape.ndim())), s);
-    }
+  if (!param.flatten) {
+    data = in_data[fullc::kData].get_with_shape<xpu, 2, DType>(
+        Shape2(ishape.ProdShape(0, ishape.ndim()-1), ishape[ishape.ndim()-1]), s);
+    out = out_data[fullc::kOut].get_with_shape<xpu, 2, DType>(
+        Shape2(oshape.ProdShape(0, oshape.ndim()-1), oshape[oshape.ndim()-1]), s);
   } else {
-      data = in_data[fullc::kData].get_with_shape<xpu, 2, DType>(
-          Shape2(ishape[0], ishape[1]), s);
-      out = out_data[fullc::kOut].get_with_shape<xpu, 2, DType>(
-          Shape2(oshape[0], oshape[1]), s);
+    data = in_data[fullc::kData].get_with_shape<xpu, 2, DType>(
+        Shape2(ishape[0], ishape.ProdShape(1, ishape.ndim())), s);
+    out = out_data[fullc::kOut].get_with_shape<xpu, 2, DType>(
+        Shape2(oshape[0], oshape.ProdShape(1, oshape.ndim())), s);
   }
 
   if (!param.trans_data) {

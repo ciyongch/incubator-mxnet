@@ -62,8 +62,9 @@ static bool FullyConnectedShape(const nnvm::NodeAttrs& attrs,
       num_input = dshape.ProdShape(1, dshape.ndim());
     }
   } else {
-    CHECK_EQ(dshape.ndim(), 2) << "trans_data only support 2-d input data.";
-    num_input = dshape[0];
+    CHECK_EQ(dshape.ndim(), 3) << "trans_data021 only support 3-d input data and bs=1.";
+    CHECK_EQ(dshape[0], 1) << "trans_data021 only support 3-d input data and bs=1.";
+    num_input = dshape[1];
   }
   SHAPE_ASSIGN_CHECK(*in_shape, fullc::kWeight, Shape2(param.num_hidden, num_input));
 
@@ -84,19 +85,26 @@ static bool FullyConnectedShape(const nnvm::NodeAttrs& attrs,
         SHAPE_ASSIGN_CHECK(*out_shape, 0, Shape2(dshape[0], param.num_hidden));
       }
     } else {
-      SHAPE_ASSIGN_CHECK(*out_shape, 0, Shape2(dshape[1], param.num_hidden))
+      mxnet::TShape result_shape(dshape);
+      result_shape[dshape.ndim()-1] = param.num_hidden;
+      result_shape[dshape.ndim()-2] = dshape[2];
+      SHAPE_ASSIGN_CHECK(*out_shape, 0, result_shape)
     }
   } else {
-    CHECK_EQ(dshape.ndim(), 2) << "trans_out only support 2-d input data.";
-    SHAPE_ASSIGN_CHECK(*out_shape, 0, Shape2(param.num_hidden, dshape[0]))
+    CHECK_EQ(dshape.ndim(), 3) << "trans_out021 only support 3-d input data and bs=1.";
+    CHECK_EQ(dshape[0], 1) << "trans_out021 only support 3-d input data and bs=1.";
+    mxnet::TShape result_shape(dshape);
+    result_shape[dshape.ndim()-2] = param.num_hidden;
+    result_shape[dshape.ndim()-1] = dshape[1];
+    SHAPE_ASSIGN_CHECK(*out_shape, 0, result_shape)
   }
 
 
   if (oshape.ndim() > 0) {
     if (!param.trans_out) {
-      dshape[0] = oshape[0];
+      dshape[1] = oshape[1];
     } else {
-      dshape[0] = oshape[1];
+      dshape[1] = oshape[2];
     }
     SHAPE_ASSIGN_CHECK(*in_shape, fullc::kData, dshape);
   }
