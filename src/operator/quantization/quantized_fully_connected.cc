@@ -111,6 +111,7 @@ bool QuantizedFullyConnectedShape(const nnvm::NodeAttrs& attrs,
   const mxnet::TShape& dshape = in_shape->at(0);
   index_t num_input;
 
+
   if (!param.trans_data) {
     if (!param.flatten) {
       num_input = dshape[dshape.ndim() - 1];
@@ -118,8 +119,18 @@ bool QuantizedFullyConnectedShape(const nnvm::NodeAttrs& attrs,
       num_input = dshape.ProdShape(1, dshape.ndim());
     }
   } else {
-    CHECK_EQ(dshape.ndim(), 2) << "trans_data only support 2-d input data.";
-    num_input = dshape[0];
+    // (1, n, c) => (1, c, n), out: (1, c, o)
+    CHECK((dshape.ndim() == 2U) || (dshape.ndim() == 3U))
+        << "For trans_data=True QFC, only support 2D/3D inputs, but got " << dshape.ndim() << ".";
+    CHECK((dshape.ndim() == 3U) && (dshape[0] == 1U))
+        << "For trans_data=True QFC and 3D input, only support dshape[0] is 1, but got "
+        << dshape[0] << ".";
+
+    if (!param.flatten) {
+      num_input = dshape.ProdShape(0, dshape.ndim() - 1);
+    } else {
+      num_input = dshape[0];
+    }
   }
 
   TShape wshape = Shape2(param.num_hidden, num_input);
@@ -143,11 +154,21 @@ bool QuantizedFullyConnectedShape(const nnvm::NodeAttrs& attrs,
         SHAPE_ASSIGN_CHECK(*out_shape, 0, Shape2(dshape[0], param.num_hidden));
       }
     } else {
-      SHAPE_ASSIGN_CHECK(*out_shape, 0, Shape2(dshape[1], param.num_hidden));
+      TShape result_shape(dshape);
+      result_shape[dshape.ndim() - 1] = param.num_hidden;
+      result_shape[dshape.ndim() - 2] = dshape[dshape.ndim() - 1];
+      SHAPE_ASSIGN_CHECK(*out_shape, 0, result_shape);
     }
   } else {
-    CHECK_EQ(dshape.ndim(), 2) << "trans_out only support 2-d input data.";
-    SHAPE_ASSIGN_CHECK(*out_shape, 0, Shape2(param.num_hidden, dshape[0]));
+    CHECK((dshape.ndim() == 2U) || (dshape.ndim() == 3U))
+        << "For trans_out=True QFC, only support 2D/3D inputs, but got " << dshape.ndim() << ".";
+    CHECK((dshape.ndim() == 3U) && (dshape[0] == 1U))
+        << "For trans_out=True QFC and 3D input, only support dshape[0] is 1, but got "
+        << dshape[0] << ".";
+    TShape result_shape(dshape);
+    result_shape[dshape.ndim() - 1] = dshape[dshape.ndim() - 2];
+    result_shape[dshape.ndim() - 2] = param.num_hidden;
+    SHAPE_ASSIGN_CHECK(*out_shape, 0, result_shape);
   }
 
   if (!param.fuse_dequantize) {
@@ -282,23 +303,34 @@ void QuantizedFullyConnectedOp::Forward(const OpContext &ctx,
   const mxnet::TShape &wshape = in_data[fullc::kWeight].shape_;
   const mxnet::TShape &oshape = out_data[fullc::kOut].shape_;
 
-  if (dshape.ndim() != 2)
-    CHECK(param_.flatten)
-        << "QuantizedFullyConnectedForwardCPU only supports flatten=true "
-        << "when dshape.ndim() != 2 for now.";
-
-  if (param_.trans_data || param_.trans_out)
-    CHECK_EQ(dshape.ndim(), 2U) << "trans_data or trans_out only supports 2D data input so far.";
-
-  bool data_is_int8 = true;
-  if(in_data[fullc::kData].type_flag_ == mshadow::kUint8)
-    data_is_int8 = false;
-
   Tensor<cpu, 2, SrcDType> data = in_data[fullc::kData].get_with_shape<cpu, 2, SrcDType>(
     Shape2(dshape[0], dshape.ProdShape(1, dshape.ndim())), s);
   Tensor<cpu, 2, int8_t> weight = in_data[fullc::kWeight].get<cpu, 2, int8_t>(s);
   Tensor<cpu, 2, DstDType> out = out_data[fullc::kOut].get_with_shape<cpu, 2, DstDType>(
     Shape2(oshape[0], oshape.ProdShape(1, oshape.ndim())), s);
+
+  if (param_.trans_data || param_.trans_out) {
+    CHECK((dshape.ndim() == 2U) || (dshape.ndim() == 3U))
+        << "For trans_data=True or trans_out=True QFC, only support 2D/3D inputs, but got "
+        << dshape.ndim() << ".";
+    CHECK((dshape.ndim() == 3U) && (dshape[0] == 1U))
+        << "For trans_data=True or trans_out=True QFC and 3D input, only support dshape[0] is 1,"
+        " but got " << dshape[0] << ".";
+
+    data = in_data[fullc::kData].get_with_shape<cpu, 2, SrcDType>(
+      Shape2(dshape.ProdShape(dshape[0], dshape.ndim() - 1), dshape[dshape.ndim() - 1]), s);
+    out = out_data[fullc::kOut].get_with_shape<cpu, 2, DstDType>(
+      Shape2(oshape.ProdShape(oshape[0], oshape.ndim() - 1), oshape[oshape.ndim() - 1]), s);
+  } else {
+    if (dshape.ndim() != 2)
+      CHECK(param_.flatten)
+          << "QuantizedFullyConnectedForwardCPU only supports flatten=true "
+          << "when dshape.ndim() != 2 for now.";
+  }
+
+  bool data_is_int8 = true;
+  if(in_data[fullc::kData].type_flag_ == mshadow::kUint8)
+    data_is_int8 = false;
 
   uint8_t* matrix_a_ptr = nullptr;
   int8_t* matrix_b_ptr = nullptr;
@@ -315,14 +347,14 @@ void QuantizedFullyConnectedOp::Forward(const OpContext &ctx,
   int shift = 128;
 
   if (param_.trans_data) {
-    m = dshape[1];
-    k = dshape[0];
+    m = dshape[dshape.ndim() - 1]; // last dshape
+    k = dshape[dshape.ndim() - 2];
     n = wshape[0];
   }
   if (param_.trans_out) {
     m = wshape[0];
-    k = dshape[1];
-    n = dshape[0];
+    k = dshape[dshape.ndim() - 1];
+    n = dshape[dshape.ndim() - 2];
   }
 
   float min_data = (in_data[num_inputs + quantized_fullc::kDataMin].get<cpu, 1, float>(s)).dptr_[0];
