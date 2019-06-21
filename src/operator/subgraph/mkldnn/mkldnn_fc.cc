@@ -132,14 +132,14 @@ void SgMKLDNNFCOp::Forward(const OpContext &ctx,
     cached_max_data_ = max_data;
     cached_min_weight_ = min_weight;
     cached_max_weight_ = max_weight;
+    std::vector<float> bias_int32_rescale = {0.0};
     NDArray bias;
-    NDArray temp_bias;
     if (has_bias) {
-      temp_bias = in_data[fullc::kBias];
+      cached_bias_ = in_data[fullc::kBias];
       cached_min_bias_ = min_bias;
       cached_max_bias_ = max_bias;
     } else {
-      temp_bias = NDArray();
+      cached_bias_ = NDArray();
     }
 
     if (mkldnn_param.quantized) {
@@ -151,18 +151,11 @@ void SgMKLDNNFCOp::Forward(const OpContext &ctx,
 
       if (has_bias) {
         bias = in_data[fullc::kBias];
-        float bias_int32_rescale = data_scale * weight_scale *
+        bias_int32_rescale[0] = data_scale * weight_scale *
             MaxAbs(cached_min_bias_, cached_max_bias_) / kInt8Range;
 
-        temp_bias = NDArray(bias.storage_type(), bias.shape(),
-                            bias.ctx(), true, mshadow::kInt32);
-        int8_t *bias_ptr = bias.data().dptr<int8_t>();
-        int32_t *quantized_bias_ptr = temp_bias.data().dptr<int32_t>();
-        size_t bias_size = bias.shape().Size();
-        #pragma omp parallel for num_threads(engine::OpenMP::Get()->GetRecommendedOMPThreadCount())
-        for (index_t i = 0; i < static_cast<index_t>(bias_size); ++i) {
-          quantized_bias_ptr[i] = bias_ptr[i] * bias_int32_rescale;
-        }
+        cached_bias_ = NDArray(bias.storage_type(), bias.shape(),
+                               bias.ctx(), true, mshadow::kInt32);
       }
 
       if (mkldnn_param.enable_float_output) {
@@ -185,7 +178,7 @@ void SgMKLDNNFCOp::Forward(const OpContext &ctx,
     }
 
     fwd_.reset(new MKLDNNFullyConnectedForward(full_param_, ctx.is_train, data, weight,
-      (has_bias ? &temp_bias : nullptr), out_md));
+      (has_bias ? &cached_bias_ : nullptr), out_md));
 
     // convert weight and bias to the format that MKL-DNN requires
     cached_weight_ = NDArray(fwd_->fwd_pd.weights_primitive_desc());
@@ -199,19 +192,26 @@ void SgMKLDNNFCOp::Forward(const OpContext &ctx,
                                       fwd_->fwd_pd.weights_primitive_desc());
     MKLDNNStream::Get()->RegisterPrim(mkldnn::reorder(
       weight_reorder_pd, *def_weights_mem, *cached_weight_mem));
-    
+
     if (has_bias) {
       cached_bias_ = NDArray(fwd_->fwd_pd.bias_primitive_desc());
       auto cached_bias_mem = cached_bias_.GetMKLDNNData();
-      auto def_bias_mem = temp_bias.GetMKLDNNData();
+      auto def_bias_mem = in_data[fullc::kBias].GetMKLDNNData();
+
+      mkldnn::primitive_attr attr;
+      if (mkldnn_param.quantized) {
+        attr.set_output_scales(0, bias_int32_rescale);
+        attr.set_int_output_round_mode(round_mode::round_nearest);
+      }
 
       auto bias_reorder_pd =
         mkldnn::reorder::primitive_desc(def_bias_mem->get_primitive_desc(),
-                                        fwd_->fwd_pd.bias_primitive_desc());
+                                        fwd_->fwd_pd.bias_primitive_desc(),
+                                        attr);
       MKLDNNStream::Get()->RegisterPrim(mkldnn::reorder(
         bias_reorder_pd, *def_bias_mem, *cached_bias_mem));
     }
-    
+
     fwd_->SetNewMem(*data.GetMKLDNNData(), *cached_weight_.GetMKLDNNData(),
                     has_bias ? cached_bias_.GetMKLDNNData() : nullptr,
                     *output.GetMKLDNNData());
@@ -219,25 +219,13 @@ void SgMKLDNNFCOp::Forward(const OpContext &ctx,
   }
 
   auto data_mem = data.GetMKLDNNDataReorder(fwd_->fwd_pd.src_primitive_desc());
-  mkldnn::memory *mem = output.CreateMKLDNNData(fwd_->fwd_pd.dst_primitive_desc());
-  fwd_->SetNewMem(*data_mem, *mem);
+  auto out_mem = CreateMKLDNNMem(output, fwd_->fwd_pd.dst_primitive_desc(),
+                                 req[fullc::kOut], &data);
+  fwd_->SetNewMem(*data_mem, *out_mem.second);
 
   MKLDNNStream::Get()->RegisterPrim(fwd_->GetFwd());
+  CommitOutput(output, out_mem);
   MKLDNNStream::Get()->Submit();
-
-  #if 0
-  std::vector<NDArray> new_inputs;
-  std::vector<OpReqType> new_req;
-  if (has_bias) {
-    new_inputs = {data, weight, cached_bias_};
-    new_req = {req[fullc::kData], req[fullc::kWeight], req[fullc::kBias]};
-  } else {
-    new_inputs = {data, weight};
-    new_req = {req[fullc::kData], req[fullc::kWeight]};
-  }
-
-  MKLDNNFCForwardFullFeature(full_param_, ctx, fwd_.get(), new_inputs, new_req, out_data);
-  #endif
 
   if (mkldnn_param.quantized && !mkldnn_param.enable_float_output) {
     float *min_output_ptr = out_data[quantized_fullc::kOutMin].data().dptr<float>();
