@@ -93,10 +93,10 @@ void broadcast_ker(DType* src,
 
 template<>
 inline void BroadcastCompute<cpu>(const nnvm::NodeAttrs& attrs,
-                                 const OpContext& ctx,
-                                 const std::vector<TBlob>& inputs,
-                                 const std::vector<OpReqType>& req,
-                                 const std::vector<TBlob>& outputs) {
+                                  const OpContext& ctx,
+                                  const std::vector<TBlob>& inputs,
+                                  const std::vector<OpReqType>& req,
+                                  const std::vector<TBlob>& outputs) {
   using namespace mshadow;
   const BroadcastAxesParam& param = nnvm::get<BroadcastAxesParam>(attrs.parsed);
   if (param.axis.ndim() == 1 && inputs[0].shape_[param.axis[0]] == 1 && req[0] == kWriteTo) {
