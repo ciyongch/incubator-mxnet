@@ -1533,6 +1533,28 @@ def test_deconvolution():
         pad = (3,)
     )
 
+@with_seed()
+def test_deconvolution_forward_with_bias():
+    """Check if deconvolution forward can work well with bias=True
+    """
+    def check_deconvolution_forward_with_bias(shape=(1, 16, 5, 5), num_filter=32, num_group=1, kernel=(3, 3), pad=(1, 1)):
+        x = mx.sym.Variable('x')
+        w = mx.sym.Variable('w')
+        input_data = mx.random.uniform(-5, 5, shape, ctx=mx.cpu())
+        y = mx.sym.Deconvolution(data=x, weight=w, num_filter=num_filter, num_group=num_group, kernel=kernel, no_bias=False, pad=pad)
+        exe = y.simple_bind(ctx=mx.cpu(), x=shape, grad_req='null')
+
+        exe.arg_arrays[0][:] = np.random.normal(size=exe.arg_arrays[0].shape)
+        exe.arg_arrays[1][:] = np.random.normal(size=exe.arg_arrays[1].shape)
+
+        exe.forward(is_train=False)
+        o = exe.outputs[0]
+        t = o.asnumpy()
+    check_deconvolution_forward_with_bias((1, 16, 5), 32, 1, (3,), (1,))
+    check_deconvolution_forward_with_bias((32, 16, 5), 32, 1, (3,), (1,))
+    check_deconvolution_forward_with_bias((1, 16, 5, 5), 32, 1, (3, 3), (1, 1))
+    check_deconvolution_forward_with_bias((32, 16, 5, 5), 32, 1, (3, 3), (1, 1))
+
 
 def check_nearest_upsampling_with_shape(shapes, scale, root_scale):
     arr = {'arg_%d'%i: mx.random.uniform(-10.0, 10.0, shape, ctx=mx.cpu()).copyto(default_context()) for i, shape in zip(range(len(shapes)), shapes)}
@@ -3383,7 +3405,6 @@ def check_l2_normalization(in_shape, mode, dtype, norm_eps=1e-10):
 
 
 @with_seed()
-@unittest.skip("Flaky test: https://github.com/apache/incubator-mxnet/issues/15004")
 def test_l2_normalization():
     for dtype in ['float16', 'float32', 'float64']:
         for mode in ['channel', 'spatial', 'instance']:
@@ -4858,7 +4879,6 @@ def test_where():
     test_1d_cond()
 
 
-@unittest.skip("Flaky test. Tracked in https://github.com/apache/incubator-mxnet/issues/13600")
 @with_seed()
 def test_softmin():
     for ndim in range(1, 5):
@@ -5337,6 +5357,30 @@ def test_boolean_mask():
     expected_grad = np.array([[0, 0, 0], [1, 1, 1], [0, 0, 0]])
     assert same(out.asnumpy(), expected)
     assert same(data.grad.asnumpy(), expected_grad)
+
+    # test gradient
+    shape = (100, 30)
+    a = mx.nd.random.randint(0, 100, shape=shape)
+    a.attach_grad()
+    bi = mx.nd.random.randint(0, 100, shape=shape[0:1]) > 50
+    ci = mx.nd.random.randint(0, 100, shape=shape[0:1]) < 50
+    mx_grad = mx.nd.zeros_like(a)
+    mx.autograd.mark_variables([a], [mx_grad], grad_reqs='add')
+    T = 3
+    for _ in range(T):
+        with mx.autograd.record():
+            b = mx.nd.contrib.boolean_mask(a, bi)
+            c = mx.nd.contrib.boolean_mask(a, ci)
+            su = b.sum() + c.sum()
+            su.backward()
+    grad = (bi + ci).asnumpy().reshape((-1,) + (1,) * (len(shape)-1))
+    grad = np.tile(grad, (1,) + shape[1:])
+    # T times
+    grad *= T
+    assert_allclose(a.grad.asnumpy(), grad)
+    a_np = a.asnumpy()
+    assert same(b.asnumpy(), a_np[bi.asnumpy().astype('bool')])
+    assert same(c.asnumpy(), a_np[ci.asnumpy().astype('bool')])
 
 
 @with_seed()
@@ -7480,14 +7524,14 @@ def test_bilinear_resize_op():
             resize_sym = mx.sym.contrib.BilinearResize2D(data_sym, None, scale_height=scale_height, scale_width=scale_width, mode=mode)
             check_symbolic_forward(resize_sym, [data_np], [expected], rtol=1e-3, atol=1e-5)
             check_symbolic_backward(resize_sym, [data_np], [out_grads], expected_backward, rtol=1e-3, atol=1e-5)
-            check_numeric_gradient(resize_sym, [data_np], rtol=1e-2, atol=1e-5)
+            check_numeric_gradient(resize_sym, [data_np], rtol=1e-2, atol=1e-4)
         else:
             data_sym_like = mx.sym.var('data_like')
             resize_sym = mx.sym.contrib.BilinearResize2D(data_sym, data_sym_like, mode=mode)
             date_np_like = x_1.asnumpy()
             check_symbolic_forward(resize_sym, [data_np, date_np_like], [expected], rtol=1e-3, atol=1e-5)
             check_symbolic_backward(resize_sym, [data_np, date_np_like], [out_grads], expected_backward, rtol=1e-3, atol=1e-5)
-            check_numeric_gradient(resize_sym, [data_np, date_np_like], rtol=1e-2, atol=1e-5)
+            check_numeric_gradient(resize_sym, [data_np, date_np_like], rtol=1e-2, atol=1e-4)
 
     shape = (2, 2, 10, 10)
     check_bilinear_resize_op(shape, 5, 5)
