@@ -91,12 +91,11 @@ void broadcast_ker(DType* src,
   }
 }
 
-template<>
-inline void BroadcastCompute<cpu>(const nnvm::NodeAttrs& attrs,
-                                  const OpContext& ctx,
-                                  const std::vector<TBlob>& inputs,
-                                  const std::vector<OpReqType>& req,
-                                  const std::vector<TBlob>& outputs) {
+inline void BroadcastAxisCompute(const nnvm::NodeAttrs& attrs,
+                                 const OpContext& ctx,
+                                 const std::vector<TBlob>& inputs,
+                                 const std::vector<OpReqType>& req,
+                                 const std::vector<TBlob>& outputs) {
   using namespace mshadow;
   const BroadcastAxesParam& param = nnvm::get<BroadcastAxesParam>(attrs.parsed);
   if (param.axis.ndim() == 1 && inputs[0].shape_[param.axis[0]] == 1 && req[0] == kWriteTo) {
@@ -275,7 +274,7 @@ Example::
 .set_attr_parser(ParamParser<BroadcastAxesParam>)
 .add_arguments(BroadcastAxesParam::__FIELDS__())
 .set_attr<mxnet::FInferShape>("FInferShape", BroadcastAxesShape)
-.set_attr<FCompute>("FCompute<cpu>", BroadcastCompute<cpu>);
+.set_attr<FCompute>("FCompute<cpu>", BroadcastAxisCompute);
 
 MXNET_OPERATOR_REGISTER_BROADCAST(broadcast_to)
 .describe(R"code(Broadcasts the input array to a new shape.
