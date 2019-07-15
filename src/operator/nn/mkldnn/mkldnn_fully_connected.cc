@@ -131,6 +131,23 @@ inline static mkldnn::inner_product_backward_weights::primitive_desc GetFCBwdWei
 }
 
 void MKLDNNFullyConnectedForward::SetNewMem(const mkldnn::memory &data,
+                                            const mkldnn::memory &output) {
+  if (this->data_ == nullptr)
+    this->data_ = std::shared_ptr<mkldnn::memory>(new mkldnn::memory(
+            fwd_pd.src_primitive_desc(), data.get_data_handle()));
+  else
+    this->data_->set_data_handle(data.get_data_handle());
+
+  if (this->out_ == nullptr)
+    this->out_ = std::shared_ptr<mkldnn::memory>(new mkldnn::memory(
+            fwd_pd.dst_primitive_desc(), output.get_data_handle()));
+  else
+    this->out_->set_data_handle(output.get_data_handle());
+
+  CHECK(this->fwd_ != nullptr);
+}
+
+void MKLDNNFullyConnectedForward::SetNewMem(const mkldnn::memory &data,
                                             const mkldnn::memory &weight,
                                             const mkldnn::memory *bias,
                                             const mkldnn::memory &output) {
@@ -263,6 +280,7 @@ void MKLDNNFCForwardFullFeature(const MKLDNNFCFullParam &full_param,
       CHECK(weight_mem->get_primitive_desc() == fwd->fwd_pd.weights_primitive_desc());
     }
   }
+
   auto out_mem = CreateMKLDNNMem(out_data[fullc::kOut],
       fwd->fwd_pd.dst_primitive_desc(), req[fullc::kOut], &data);
   if (!full_param.default_param.no_bias) {
@@ -272,6 +290,7 @@ void MKLDNNFCForwardFullFeature(const MKLDNNFCFullParam &full_param,
   } else {
     fwd->SetNewMem(*data_mem, *weight_mem, nullptr, *out_mem.second);
   }
+
   MKLDNNStream::Get()->RegisterPrim(fwd->GetFwd());
   CommitOutput(out_data[fullc::kOut], out_mem);
   MKLDNNStream::Get()->Submit();

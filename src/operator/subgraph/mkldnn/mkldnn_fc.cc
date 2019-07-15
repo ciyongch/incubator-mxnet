@@ -38,10 +38,20 @@
 namespace mxnet {
 namespace op {
 
+namespace sg_mkldnn_fc {
+  enum initializedMask {
+    kUnInitialized = 0,
+    kDataInitialized = 1 << 0,
+    kWeightInitialized = 1 << 1,
+    kBiasInitialized = 1 << 2,
+    kAllInitialized = 0x7
+  };
+}
+
 class SgMKLDNNFCOp {
  public:
   explicit SgMKLDNNFCOp(const nnvm::NodeAttrs &attrs)
-    : initialized_(false),
+    : initialized_mask_(sg_mkldnn_fc::kUnInitialized),
       subgraph_sym_(*attrs.subgraphs[0]),
       full_param_(nnvm::get<MKLDNNFCFullParam>(attrs.parsed)) {}
 
@@ -59,10 +69,11 @@ class SgMKLDNNFCOp {
   }
 
  private:
-  bool initialized_;
+  int initialized_mask_;
   nnvm::Symbol subgraph_sym_;
   MKLDNNFCFullParam full_param_;
   std::shared_ptr<MKLDNNFullyConnectedForward> fwd_;
+  NDArray cached_weight_;
   NDArray cached_bias_;
   float cached_min_data_;
   float cached_max_data_;
@@ -117,19 +128,24 @@ void SgMKLDNNFCOp::Forward(const OpContext &ctx,
   mkldnn::memory::desc out_md = GetMemDesc(output);
   MKLDNNFCFlattenData(default_param, out_data[fullc::kOut], &data, &out_md);
 
-  if (initialized_ && mkldnn_param.quantized) {
-    if (cached_min_data_ != min_data || cached_max_data_ != max_data ||
-        cached_min_weight_ != min_weight || cached_max_weight_ != max_weight ||
-        (has_bias && (cached_min_bias_ != min_bias || cached_max_bias_ != max_bias))) {
-          initialized_ = false;
-        }
+  if (initialized_mask_ && mkldnn_param.quantized) {
+    if (cached_min_data_ != min_data || cached_max_data_ != max_data)
+      initialized_mask_ &= ~sg_mkldnn_fc::kDataInitialized;
+
+    if (cached_min_weight_ != min_weight || cached_max_weight_ != max_weight)
+      initialized_mask_ &= ~sg_mkldnn_fc::kWeightInitialized;
+
+    if (has_bias && (cached_min_bias_ != min_bias || cached_max_bias_ != max_bias))
+      initialized_mask_ &= ~sg_mkldnn_fc::kBiasInitialized;
   }
 
-  if (!initialized_) {
+  if ((initialized_mask_ & sg_mkldnn_fc::kAllInitialized) != sg_mkldnn_fc::kAllInitialized) {
     cached_min_data_ = min_data;
     cached_max_data_ = max_data;
     cached_min_weight_ = min_weight;
     cached_max_weight_ = max_weight;
+    std::vector<float> bias_int32_rescale = {0.0};
+    NDArray bias;
     if (has_bias) {
       cached_bias_ = in_data[fullc::kBias];
       cached_min_bias_ = min_bias;
@@ -146,19 +162,12 @@ void SgMKLDNNFCOp::Forward(const OpContext &ctx,
       float quantized_out_range = mkldnn_param.with_relu ? kUint8Range : kInt8Range;
 
       if (has_bias) {
-        NDArray bias = in_data[fullc::kBias];
-        float bias_int32_rescale = data_scale * weight_scale *
+        bias = in_data[fullc::kBias];
+        bias_int32_rescale[0] = data_scale * weight_scale *
             MaxAbs(cached_min_bias_, cached_max_bias_) / kInt8Range;
 
         cached_bias_ = NDArray(bias.storage_type(), bias.shape(),
                                bias.ctx(), true, mshadow::kInt32);
-        int8_t *bias_ptr = bias.data().dptr<int8_t>();
-        int32_t *quantized_bias_ptr = cached_bias_.data().dptr<int32_t>();
-        size_t bias_size = bias.shape().Size();
-        #pragma omp parallel for num_threads(engine::OpenMP::Get()->GetRecommendedOMPThreadCount())
-        for (index_t i = 0; i < static_cast<index_t>(bias_size); ++i) {
-          quantized_bias_ptr[i] = bias_ptr[i] * bias_int32_rescale;
-        }
       }
 
       if (mkldnn_param.enable_float_output) {
@@ -182,19 +191,55 @@ void SgMKLDNNFCOp::Forward(const OpContext &ctx,
 
     fwd_.reset(new MKLDNNFullyConnectedForward(full_param_, ctx.is_train, data, weight,
       (has_bias ? &cached_bias_ : nullptr), out_md));
-    initialized_ = true;
-  }
-  std::vector<NDArray> new_inputs;
-  std::vector<OpReqType> new_req;
-  if (has_bias) {
-    new_inputs = {data, weight, cached_bias_};
-    new_req = {req[fullc::kData], req[fullc::kWeight], req[fullc::kBias]};
-  } else {
-    new_inputs = {data, weight};
-    new_req = {req[fullc::kData], req[fullc::kWeight]};
+
+    // convert weight and bias to the format that MKL-DNN requires
+    if (!(initialized_mask_ & sg_mkldnn_fc::kWeightInitialized)) {
+      cached_weight_ = NDArray(fwd_->fwd_pd.weights_primitive_desc());
+      auto cached_weight_mem = cached_weight_.GetMKLDNNData();
+      auto def_weights_mem = GetWeights(weight, 1);
+      if (def_weights_mem == nullptr)
+        def_weights_mem = weight.GetMKLDNNData();
+
+      auto weight_reorder_pd =
+        mkldnn::reorder::primitive_desc(def_weights_mem->get_primitive_desc(),
+                                        fwd_->fwd_pd.weights_primitive_desc());
+      MKLDNNStream::Get()->RegisterPrim(mkldnn::reorder(
+        weight_reorder_pd, *def_weights_mem, *cached_weight_mem));
+    }
+
+    if (has_bias) {
+      cached_bias_ = NDArray(fwd_->fwd_pd.bias_primitive_desc());
+      auto cached_bias_mem = cached_bias_.GetMKLDNNData();
+      auto def_bias_mem = in_data[fullc::kBias].GetMKLDNNData();
+
+      mkldnn::primitive_attr attr;
+      if (mkldnn_param.quantized) {
+        attr.set_output_scales(0, bias_int32_rescale);
+        attr.set_int_output_round_mode(round_mode::round_nearest);
+      }
+
+      auto bias_reorder_pd =
+        mkldnn::reorder::primitive_desc(def_bias_mem->get_primitive_desc(),
+                                        fwd_->fwd_pd.bias_primitive_desc(),
+                                        attr);
+      MKLDNNStream::Get()->RegisterPrim(mkldnn::reorder(
+        bias_reorder_pd, *def_bias_mem, *cached_bias_mem));
+    }
+
+    fwd_->SetNewMem(*data.GetMKLDNNData(), *cached_weight_.GetMKLDNNData(),
+                    has_bias ? cached_bias_.GetMKLDNNData() : nullptr,
+                    *output.GetMKLDNNData());
+    initialized_mask_ = sg_mkldnn_fc::kAllInitialized;;
   }
 
-  MKLDNNFCForwardFullFeature(full_param_, ctx, fwd_.get(), new_inputs, new_req, out_data);
+  auto data_mem = data.GetMKLDNNDataReorder(fwd_->fwd_pd.src_primitive_desc());
+  auto out_mem = CreateMKLDNNMem(output, fwd_->fwd_pd.dst_primitive_desc(),
+                                 req[fullc::kOut], &data);
+  fwd_->SetNewMem(*data_mem, *out_mem.second);
+
+  MKLDNNStream::Get()->RegisterPrim(fwd_->GetFwd());
+  CommitOutput(output, out_mem);
+  MKLDNNStream::Get()->Submit();
 
   if (mkldnn_param.quantized && !mkldnn_param.enable_float_output) {
     float *min_output_ptr = out_data[quantized_fullc::kOutMin].data().dptr<float>();
