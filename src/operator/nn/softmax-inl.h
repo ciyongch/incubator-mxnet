@@ -524,6 +524,12 @@ struct SoftmaxParam : public dmlc::Parameter<SoftmaxParam> {
     .set_default(dmlc::optional<bool>(false))
     .describe("Whether to use the length input as a mask over the data input.");
   }
+
+  bool operator==(const SoftmaxParam& other) const {
+    return this->axis == other.axis &&
+           this->temperature == other.temperature &&
+           this->dtype == other.dtype;
+  }
 };
 
 static inline bool softmax_has_dtype_override(const nnvm::NodeAttrs& attrs) {
@@ -810,8 +816,21 @@ void SoftmaxGradCompute(const nnvm::NodeAttrs& attrs,
     });
   });
 }
-
 }  // namespace op
 }  // namespace mxnet
+
+namespace std {
+template<>
+struct hash<mxnet::op::SoftmaxParam> {
+  size_t operator()(const mxnet::op::SoftmaxParam& val) {
+    size_t ret = 0;
+    ret = dmlc::HashCombine(ret, val.axis);
+    ret = dmlc::HashCombine(ret, val.temperature);
+    ret = dmlc::HashCombine(ret, val.dtype);
+    return ret;
+  }
+};
+}  // namespace std
+
 
 #endif  // MXNET_OPERATOR_NN_SOFTMAX_INL_H_
