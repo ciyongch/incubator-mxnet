@@ -38,6 +38,30 @@
 namespace mxnet {
 namespace op {
 
+const std::vector<std::pair<float, float> > g_shift_conditions = {
+  //std::make_pair<float, float>(-0.16997, 145.5459),
+  //std::make_pair<float, float>(-0.16997, 20.9062)
+  std::make_pair<float, float>(-145.5459, 145.5459),
+  std::make_pair<float, float>(-20.9062, 20.9062)
+};
+
+#define DELTA 1e-4
+#define IS_CLOSE(a, b) ((std::abs((a) - (b)) < DELTA) ? true : false)
+static inline bool check_if_need_shift(const float min, const float max) {
+  static bool shift_quantization_enable = dmlc::GetEnv("MXNET_MKLDNN_SHIFT_QUANTIZATION", true);
+  if (!shift_quantization_enable)
+    return false;
+
+  for (auto &e: g_shift_conditions) {
+    //std::cout << "min: " << min << " vs " << e.first << ", max: " << max << " vs " << e.second << "." << std::endl;
+    //if ((std::abs(min - e.first) < DELTA) && (std::abs(max - e.second) < DELTA))
+    if (IS_CLOSE(min, e.first) && IS_CLOSE(max, e.second))
+      return true;
+  }
+
+  return false;
+}
+
 class SgMKLDNNFCOp {
  public:
   explicit SgMKLDNNFCOp(const nnvm::NodeAttrs &attrs)
@@ -73,6 +97,10 @@ class SgMKLDNNFCOp {
   float cached_max_bias_;
   float cached_min_output_;
   float cached_max_output_;
+  bool need_shift_;
+  float shift_;
+  std::vector<float> weight_compensation_;
+  NDArray shifted_data_;
 };
 
 void SgMKLDNNFCOp::Forward(const OpContext &ctx,
@@ -93,6 +121,8 @@ void SgMKLDNNFCOp::Forward(const OpContext &ctx,
   float max_weight = 0.0;
   float min_bias = 0.0;
   float max_bias = 0.0;
+  float data_scale = 1.0;
+  float data_revert_scale = 1.0;
 
   if (mkldnn_param.quantized) {
     total_num_inputs = base_num_inputs * 3;
@@ -126,7 +156,6 @@ void SgMKLDNNFCOp::Forward(const OpContext &ctx,
         }
   }
 
-  // TODO, check cached_weight_ and cached_bias_
   if (!initialized_) {
     cached_min_data_ = min_data;
     cached_max_data_ = max_data;
@@ -145,9 +174,41 @@ void SgMKLDNNFCOp::Forward(const OpContext &ctx,
     if (mkldnn_param.quantized) {
       CHECK(data.dtype() == mshadow::kInt8 || data.dtype() == mshadow::kUint8);
       auto data_range = (data.dtype() == mshadow::kInt8) ? kInt8Range : kUint8Range;
-      float data_scale  = data_range / MaxAbs(cached_min_data_, cached_max_data_);
+
+      data_scale = data_range / MaxAbs(cached_min_data_, cached_max_data_);
       float weight_scale = kInt8Range / MaxAbs(cached_min_weight_, cached_max_weight_);
       float quantized_out_range = mkldnn_param.with_relu ? kUint8Range : kInt8Range;
+
+      // TODO(ciyong), check if current data needs shifting
+      // update min_data/max_data/data_range
+      // calc shift * weight and cache it which will be required in compensation step.
+      need_shift_ = check_if_need_shift(cached_min_data_, cached_max_data_);
+      if (need_shift_) {
+        shift_ = 0.16997;
+        //shift_ = std::abs(cached_min_data_);
+        //std::cout << "@@ shift quantization (" << shift_ << ")." << std::endl;
+        data_scale = kUint8Range / MaxAbs(0.0f, cached_max_data_ + shift_);
+        data_revert_scale = MaxAbs(cached_min_data_, cached_max_data_) / data_range;
+
+        // assume weight is in default format, which is true for the first load
+        if (weight.IsMKLDNNData())
+          weight = weight.Reorder2Default();
+
+        mxnet::TShape wshape = weight.shape();
+        CHECK_EQ(wshape.ndim(), 2U); // weight in oi format by default
+        size_t num_channel = wshape[0];
+        size_t offset = wshape[1];
+        int8_t* weight_ptr = weight.data().dptr<int8_t>();
+        weight_compensation_.resize(num_channel);
+        #pragma omp parallel for num_threads(engine::OpenMP::Get()->GetRecommendedOMPThreadCount())
+        for (int i = 0; i < static_cast<int>(num_channel); ++i) {
+          int sum = 0;
+          for (int j = 0; j < static_cast<int>(offset); ++j) {
+            sum += weight_ptr[i * offset + j];
+          }
+          weight_compensation_[i] = shift_ * sum / weight_scale;
+        }
+      }
 
       if (has_bias) {
         bias = in_data[fullc::kBias];
@@ -177,8 +238,16 @@ void SgMKLDNNFCOp::Forward(const OpContext &ctx,
       }
     }
 
-    fwd_.reset(new MKLDNNFullyConnectedForward(full_param_, ctx.is_train, data, weight,
-      (has_bias ? &cached_bias_ : nullptr), out_md));
+    // TODO(ciyong), create INT8 primitive based on u8 data type.
+    if (need_shift_) {
+      shifted_data_ = NDArray(data.storage_type(), data.shape(),
+                             data.ctx(), true, mshadow::kUint8);
+      fwd_.reset(new MKLDNNFullyConnectedForward(full_param_, ctx.is_train, shifted_data_, weight,
+        (has_bias ? &cached_bias_ : nullptr), out_md));
+    } else {
+      fwd_.reset(new MKLDNNFullyConnectedForward(full_param_, ctx.is_train, data, weight,
+        (has_bias ? &cached_bias_ : nullptr), out_md));
+    }
 
     // convert weight and bias to the format that MKL-DNN requires
     cached_weight_ = NDArray(fwd_->fwd_pd.weights_primitive_desc());
@@ -218,7 +287,26 @@ void SgMKLDNNFCOp::Forward(const OpContext &ctx,
     initialized_ = true;
   }
 
-  auto data_mem = data.GetMKLDNNDataReorder(fwd_->fwd_pd.src_primitive_desc());
+  // TODO(ciyong), if data need shift
+  // 1) convert int8 data to FP32
+  // 2) shift data by shift_
+  // 3) do quantization base on updated scale_data
+  // 4) compensation on the results (minus shift * weight_column).
+  const mkldnn::memory* data_mem;
+  if (need_shift_) {
+    const auto data_size = data.shape().Size();
+    int8_t* s8_data_ptr = data.data().dptr<int8_t>(); // make sure it's not MKLDNN Data
+    uint8_t* u8_data_ptr = shifted_data_.data().dptr<uint8_t>(); // make sure it's not MKLDNN Data
+    const float factor = data_revert_scale * data_scale;
+    const float shift_scale = shift_ * data_scale;
+    #pragma omp parallel for num_threads(engine::OpenMP::Get()->GetRecommendedOMPThreadCount())
+    for (index_t i = 0; i < static_cast<index_t>(data_size); ++i) {
+      u8_data_ptr[i] = s8_data_ptr[i] * factor + shift_scale;
+    }
+    data_mem = shifted_data_.GetMKLDNNDataReorder(fwd_->fwd_pd.src_primitive_desc());
+  } else {
+    data_mem = data.GetMKLDNNDataReorder(fwd_->fwd_pd.src_primitive_desc());
+  }
   auto out_mem = CreateMKLDNNMem(output, fwd_->fwd_pd.dst_primitive_desc(),
                                  req[fullc::kOut], &data);
   fwd_->SetNewMem(*data_mem, *out_mem.second);
@@ -226,6 +314,18 @@ void SgMKLDNNFCOp::Forward(const OpContext &ctx,
   MKLDNNStream::Get()->RegisterPrim(fwd_->GetFwd());
   CommitOutput(output, out_mem);
   MKLDNNStream::Get()->Submit();
+
+  if (need_shift_) {
+    size_t num_batch = output.shape()[0];
+    size_t num_channel = output.shape()[1];
+    float* out_ptr = output.data().dptr<float>();
+    #pragma omp parallel for num_threads(engine::OpenMP::Get()->GetRecommendedOMPThreadCount())
+    for (index_t i = 0; i < static_cast<index_t>(num_batch); ++i) {
+      for (index_t j = 0; j < static_cast<index_t>(num_channel); ++j) {
+        out_ptr[i * num_channel + j] -= weight_compensation_[j];
+      }
+    }
+  }
 
   if (mkldnn_param.quantized && !mkldnn_param.enable_float_output) {
     float *min_output_ptr = out_data[quantized_fullc::kOutMin].data().dptr<float>();
