@@ -50,6 +50,9 @@ class SgMKLDNNQuantizeOperator {
   std::shared_ptr<mkldnn::memory> i_mem_;
   std::shared_ptr<mkldnn::memory> o_mem_;
   std::shared_ptr<mkldnn::reorder> fwd_pd_;
+  bool need_shift_{false};
+  int32_t shift_{0};
+  float scale_{0.f};
 };
 
 void SgMKLDNNQuantizeOperator::Forward(const OpContext &ctx, const std::vector<NDArray> &inputs,
@@ -109,6 +112,7 @@ void SgMKLDNNQuantizeOperator::Forward(const OpContext &ctx, const std::vector<N
 
     // Write output min/max
     auto out_type = GetQuantizeOutputType(param_);
+    // shift quantization always go to Uint8 path, just pass the real min/max to the next op
     if (out_type == mshadow::kUint8) {
       quantized_range = kUint8Range;
       *outputs[1].data().dptr<float>() = data_min;
@@ -126,39 +130,60 @@ void SgMKLDNNQuantizeOperator::Forward(const OpContext &ctx, const std::vector<N
       cached_data_min_ = data_min;
       cached_data_max_ = data_max;
       float real_range = MaxAbs(data_min, data_max);
-      float scale = quantized_range / real_range;
-      primitive_attr attr;
-      const int mask = 0;
-      std::vector<float> scales = {scale};
-      attr.set_output_scales(mask, scales);
-      attr.set_int_output_round_mode(round_nearest);
-      mkldnn::engine cpu_engine = mxnet::CpuEngine::Get()->get_engine();
-      auto i_mpd = i_mem->get_primitive_desc();
-      auto i_desc = i_mpd.desc();
-      mkldnn::memory::format i_fmt = static_cast<mkldnn::memory::format>(i_desc.data.format);
-      if (i_fmt == mkldnn::memory::format::nchw || i_fmt == mkldnn::memory::format::nChw8c ||
-          i_fmt == mkldnn_nChw16c) {
-        i_fmt = mkldnn::memory::format::nhwc;
+
+      need_shift_ = check_if_need_shift(data_min, data_max);
+      if (need_shift_) {
+        real_range = data_max - data_min;
+        scale_ = quantized_range / real_range;
+        shift_ = std::abs(data_min) * scale_ + 0.5;
+      } else {
+        float scale = quantized_range / real_range;
+        primitive_attr attr;
+        const int mask = 0;
+        std::vector<float> scales = {scale};
+        attr.set_output_scales(mask, scales);
+        attr.set_int_output_round_mode(round_nearest);
+        mkldnn::engine cpu_engine = mxnet::CpuEngine::Get()->get_engine();
+        auto i_mpd = i_mem->get_primitive_desc();
+        auto i_desc = i_mpd.desc();
+        mkldnn::memory::format i_fmt = static_cast<mkldnn::memory::format>(i_desc.data.format);
+        if (i_fmt == mkldnn::memory::format::nchw || i_fmt == mkldnn::memory::format::nChw8c ||
+            i_fmt == mkldnn_nChw16c) {
+          i_fmt = mkldnn::memory::format::nhwc;
+        }
+        size_t i_ndim = in_buffer.shape().ndim();
+        mkldnn::memory::dims i_dims = mkldnn::memory::dims(i_ndim);
+        for (size_t i = 0; i < i_ndim; i++) {
+          i_dims[i] = static_cast<int>(in_buffer.shape()[i]);
+        }
+        auto o_desc = mkldnn::memory::desc(i_dims, get_mkldnn_type(out_type), i_fmt);
+        auto o_mpd = memory::primitive_desc(o_desc, cpu_engine);
+        auto reorder_pd = reorder::primitive_desc(i_mpd, o_mpd, attr);
+        i_mem_ = std::make_shared<mkldnn::memory>(i_mpd, nullptr);
+        o_mem_ = std::make_shared<mkldnn::memory>(o_mpd, nullptr);
+        fwd_pd_ = std::make_shared<mkldnn::reorder>(reorder_pd, *i_mem_, *o_mem_);
       }
-      size_t i_ndim = in_buffer.shape().ndim();
-      mkldnn::memory::dims i_dims = mkldnn::memory::dims(i_ndim);
-      for (size_t i = 0; i < i_ndim; i++) {
-        i_dims[i] = static_cast<int>(in_buffer.shape()[i]);
-      }
-      auto o_desc = mkldnn::memory::desc(i_dims, get_mkldnn_type(out_type), i_fmt);
-      auto o_mpd = memory::primitive_desc(o_desc, cpu_engine);
-      auto reorder_pd = reorder::primitive_desc(i_mpd, o_mpd, attr);
-      i_mem_ = std::make_shared<mkldnn::memory>(i_mpd, nullptr);
-      o_mem_ = std::make_shared<mkldnn::memory>(o_mpd, nullptr);
-      fwd_pd_ = std::make_shared<mkldnn::reorder>(reorder_pd, *i_mem_, *o_mem_);
       initalized_ = true;
     }
-    auto o_mem = CreateMKLDNNMem(outputs[0], o_mem_->get_primitive_desc(), req[0]);
-    i_mem_->set_data_handle(i_mem->get_data_handle());
-    o_mem_->set_data_handle(o_mem.second->get_data_handle());
-    MKLDNNStream::Get()->RegisterPrim(*fwd_pd_);
-    CommitOutput(outputs[0], o_mem);
-    MKLDNNStream::Get()->Submit();
+    if (need_shift_) {
+      if (in_buffer.IsView() && in_buffer.IsMKLDNNData())
+        in_buffer = inputs[0].Reorder2Default();
+      auto input_size = in_buffer.shape().Size();
+      auto input_ptr = in_buffer.data().dptr<float>();
+      //output should be uint8_t when shift quantization
+      auto output_ptr = outputs[0].data().dptr<uint8_t>();
+      #pragma omp parallel for num_threads(engine::OpenMP::Get()->GetRecommendedOMPThreadCount())
+      for (index_t i = 0; i < static_cast<index_t>(input_size); ++i) {
+        output_ptr[i] = static_cast<uint8_t>(input_ptr[i] * scale_ + shift_ + 0.5);
+      }
+    } else {
+      auto o_mem = CreateMKLDNNMem(outputs[0], o_mem_->get_primitive_desc(), req[0]);
+      i_mem_->set_data_handle(i_mem->get_data_handle());
+      o_mem_->set_data_handle(o_mem.second->get_data_handle());
+      MKLDNNStream::Get()->RegisterPrim(*fwd_pd_);
+      CommitOutput(outputs[0], o_mem);
+      MKLDNNStream::Get()->Submit();
+    }
   }
 }
 

@@ -194,9 +194,42 @@ inline size_t ConfigReduce(mshadow::Stream<xpu>* s,
 
 enum QuantizeOutType { kAuto = 0, kInt8, kUint8 };
 
+const std::vector<std::pair<float, float> > g_shift_conditions = {
+  std::make_pair<float, float>(-0.16997, 145.5459),
+  std::make_pair<float, float>(-0.16997, 20.9062)
+};
+
+#define DELTA 1e-4
+#define IS_CLOSE(a, b) ((std::abs((a) - (b)) < DELTA) ? true : false)
+static inline bool check_if_need_shift(const float min, const float max) {
+  const bool shift_quantization_enable = dmlc::GetEnv("MXNET_MKLDNN_SHIFT_QUANTIZATION", true);
+  if (!shift_quantization_enable)
+    return false;
+
+  for (auto &e: g_shift_conditions) {
+    //std::cout << "min: " << min << " vs " << e.first << ", max: " << max << " vs " << e.second << "." << std::endl;
+    //if ((std::abs(min - e.first) < DELTA) && (std::abs(max - e.second) < DELTA))
+    if (IS_CLOSE(min, e.first) && IS_CLOSE(max, e.second))
+      return true;
+  }
+
+  return false;
+}
+
 template<typename Param>
 static mshadow::TypeFlag GetQuantizeOutputType(const Param &param) {
   auto out_type = mshadow::kInt8;
+  if ((param.out_type == QuantizeOutType::kAuto ||
+      param.out_type == QuantizeOutType::kInt8) &&
+      (param.min_calib_range.has_value() && param.max_calib_range.has_value())) {
+    auto min = param.min_calib_range.value();
+    auto max = param.max_calib_range.value();
+    if (check_if_need_shift(min, max)) {
+      //std::cout << "shift quantization enabled." << std::endl;
+      return mshadow::kUint8;
+    }
+  }
+
   if (param.out_type == QuantizeOutType::kAuto) {
     if (param.min_calib_range.has_value() && param.max_calib_range.has_value()) {
       if (param.min_calib_range.value() >= 0.0) {
