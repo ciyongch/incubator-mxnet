@@ -24,6 +24,8 @@
 #ifndef MXNET_OPERATOR_QUANTIZATION_QUANTIZATION_UTILS_H_
 #define MXNET_OPERATOR_QUANTIZATION_QUANTIZATION_UTILS_H_
 
+#include <fstream>
+#include <sstream>
 #include <mxnet/base.h>
 #include <algorithm>
 #include "../mxnet_op.h"
@@ -193,18 +195,106 @@ inline size_t ConfigReduce(mshadow::Stream<xpu>* s,
 }
 
 enum QuantizeOutType { kAuto = 0, kInt8, kUint8 };
-
+#if 0
 const std::vector<std::pair<float, float> > g_shift_conditions = {
-  std::make_pair<float, float>(-0.16997, 145.5459),
-  std::make_pair<float, float>(-0.16997, 20.9062)
+  //std::make_pair<float, float>(-0.16997, 145.5459),
+  //std::make_pair<float, float>(-0.16997, 20.9062),
+
+  // bert-mrpc
+  #if 0
+    // abs(max/min) > 10
+    std::make_pair<float, float>(-0.16997, 12.23866), //5
+    std::make_pair<float, float>(-0.16997, 9.902475), //11
+    std::make_pair<float, float>(-0.16997, 72.168022), //17
+    std::make_pair<float, float>(-0.16997, 9.507257), //23
+    std::make_pair<float, float>(-0.16997, 11.153835), //29
+    std::make_pair<float, float>(-0.16997, 13.415039), //35
+    std::make_pair<float, float>(-0.16997, 8.568485), //41
+    std::make_pair<float, float>(-0.16997, 8.376305), //47
+    std::make_pair<float, float>(-0.16997, 26.527033), //53
+    std::make_pair<float, float>(-0.16997, 92.492859), //59
+    std::make_pair<float, float>(-0.16997, 145.5459), // 65
+    std::make_pair<float, float>(-0.16997, 20.9062) //71
+  #endif
+
+  #if 0
+    // abs(max/min) > 100
+    std::make_pair<float, float>(-0.16997, 72.168022), //17
+    std::make_pair<float, float>(-0.16997, 26.527033), //53
+    std::make_pair<float, float>(-0.16997, 92.492859), //59
+    std::make_pair<float, float>(-0.16997, 145.5459), // 65
+    std::make_pair<float, float>(-0.16997, 20.9062) //71
+  #endif
+
+  #if 0
+    // abs(max/min) > 400
+    std::make_pair<float, float>(-0.16997, 72.168022), //17
+    std::make_pair<float, float>(-0.16997, 92.492859), //59,  negative
+    std::make_pair<float, float>(-0.16997, 145.5459), // 65
+  #endif
+    std::make_pair<float, float>(-0.16997, 145.5459), // 65, best accuracy
+    std::make_pair<float, float>(-0.16997, 72.168022), //17
+
+  #if 0
+    // last two layers
+    std::make_pair<float, float>(-0.16997, 145.5459), // 65
+    std::make_pair<float, float>(-0.16997, 20.9062), //71
+  #endif
+
+  // bert-squad
+  #if 0
+    //skipped 11 fcs
+    std::make_pair<float, float>(-0.16997, 11.831016), //5
+    std::make_pair<float, float>(-0.16997, 14.098026), //11
+    std::make_pair<float, float>(-0.16997, 69.65054), //17
+    std::make_pair<float, float>(-0.16997, 11.092134), //23
+    std::make_pair<float, float>(-0.16997, 11.659933), //29
+    std::make_pair<float, float>(-0.16997, 11.97961), //35
+    std::make_pair<float, float>(-0.16997, 7.995568), //41
+    std::make_pair<float, float>(-0.16997, 8.07521), //47
+    std::make_pair<float, float>(-0.16997, 15.86858), //53
+    std::make_pair<float, float>(-0.16997, 76.436462), // 59
+    std::make_pair<float, float>(-0.16997, 120.2455), // 65
+  #endif
+  #if 1
+    // abs(max/min) > 400
+    //std::make_pair<float, float>(-0.16997, 69.65054), //17
+    //std::make_pair<float, float>(-0.16997, 76.436462), // 59
+    //std::make_pair<float, float>(-0.16997, 120.2455), // 65
+  #endif
+
 };
+#endif
+
+static void initial_shift_pairs(std::vector<std::pair<float, float> >&shift_conditions) {
+  std::ifstream input_file("/home/ciyong/miniconda3/envs/dbg/ws/bert_calib_range.txt");
+  std::string line;
+
+  float value;
+  std::vector<float> values{2};
+  while (std::getline(input_file, line)) {
+    std::stringstream ss(line);
+
+    int i = 0;
+    while (ss >> value) {
+      values[i++] = value;
+    }
+    CHECK(i == 2) << "data from bert_calib_range.txt are not in pair.";
+    shift_conditions.emplace_back(values[0], values[1]);
+  }
+}
 
 #define DELTA 1e-4
 #define IS_CLOSE(a, b) ((std::abs((a) - (b)) < DELTA) ? true : false)
 static inline bool check_if_need_shift(const float min, const float max) {
   const bool shift_quantization_enable = dmlc::GetEnv("MXNET_MKLDNN_SHIFT_QUANTIZATION", true);
-  if (!shift_quantization_enable)
+  if (!shift_quantization_enable) {
+    //std::cout << "@disable shift quantization" << std::endl;
     return false;
+  }
+
+  std::vector<std::pair<float, float> > g_shift_conditions;
+  initial_shift_pairs(g_shift_conditions);
 
   for (auto &e: g_shift_conditions) {
     //std::cout << "min: " << min << " vs " << e.first << ", max: " << max << " vs " << e.second << "." << std::endl;
