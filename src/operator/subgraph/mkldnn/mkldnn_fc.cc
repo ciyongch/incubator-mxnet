@@ -41,19 +41,85 @@ namespace op {
 const std::vector<std::pair<float, float> > g_shift_conditions = {
   //std::make_pair<float, float>(-0.16997, 145.5459),
   //std::make_pair<float, float>(-0.16997, 20.9062)
-  std::make_pair<float, float>(-145.5459, 145.5459),
-  std::make_pair<float, float>(-20.9062, 20.9062)
+
+// bert-mrpc
+#if 0
+  // abs(max/min) > 10
+  std::make_pair<float, float>(-12.23866, 12.23866), //5
+  std::make_pair<float, float>(-9.902475, 9.902475), //11
+  std::make_pair<float, float>(-72.168022, 72.168022), //17
+  std::make_pair<float, float>(-9.507257, 9.507257), //23
+  std::make_pair<float, float>(-11.153835, 11.153835), //29
+  std::make_pair<float, float>(-13.415039, 13.415039), //35
+  std::make_pair<float, float>(-8.568485, 8.568485), //41
+  std::make_pair<float, float>(-8.376305, 8.376305), //47
+  std::make_pair<float, float>(-26.527033, 26.527033), //53
+  std::make_pair<float, float>(-92.492859, 92.492859), //59
+  std::make_pair<float, float>(-145.5459, 145.5459), // 65
+  std::make_pair<float, float>(-20.9062, 20.9062) //71
+#endif
+
+#if 0
+  // abs(max/min) > 100
+  std::make_pair<float, float>(-72.168022, 72.168022), //17
+  std::make_pair<float, float>(-26.527033, 26.527033), //53
+  std::make_pair<float, float>(-92.492859, 92.492859), //59
+  std::make_pair<float, float>(-145.5459, 145.5459), // 65
+  std::make_pair<float, float>(-20.9062, 20.9062) //71
+#endif
+
+#if 0
+  // abs(max/min) > 400
+  std::make_pair<float, float>(-72.168022, 72.168022), //17, positive
+  std::make_pair<float, float>(-92.492859, 92.492859), //59, negative
+  std::make_pair<float, float>(-145.5459, 145.5459), // 65,  positive
+#endif
+  //std::make_pair<float, float>(-145.5459, 145.5459), // 65, best accuracy
+  //std::make_pair<float, float>(-72.168022, 72.168022), //17
+
+#if 0
+  // last two layers
+  std::make_pair<float, float>(-145.5459, 145.5459), // 65
+  std::make_pair<float, float>(-20.9062, 20.9062) //71
+#endif
+
+// bert-squad
+#if 1
+  //skipped 11 fcs
+  std::make_pair<float, float>(-11.831016, 11.831016), //5
+  std::make_pair<float, float>(-14.098026, 14.098026), //11
+  std::make_pair<float, float>(-69.65054, 69.65054), //17
+  std::make_pair<float, float>(-11.092134, 11.092134), //23
+  std::make_pair<float, float>(-11.659933, 11.659933), //29
+  std::make_pair<float, float>(-11.97961, 11.97961), //35
+  std::make_pair<float, float>(-7.995568, 7.995568), //41
+  std::make_pair<float, float>(-8.07521, 8.07521), //47
+  std::make_pair<float, float>(-15.86858, 15.86858), //53
+  std::make_pair<float, float>(-76.436462, 76.436462), // 59
+  std::make_pair<float, float>(-120.2455, 120.2455), // 65
+#endif
+#if 1
+  // abs(max/min) > 400
+  //std::make_pair<float, float>(-69.65054, 69.65054), //17
+  //std::make_pair<float, float>(-76.436462, 76.436462), // 59
+  //std::make_pair<float, float>(-120.2455, 120.2455), // 65
+#endif
+
 };
 
 #define DELTA 1e-4
 #define IS_CLOSE(a, b) ((std::abs((a) - (b)) < DELTA) ? true : false)
 static inline bool check_if_need_shift(const float min, const float max) {
-  static bool shift_quantization_enable = dmlc::GetEnv("MXNET_MKLDNN_SHIFT_QUANTIZATION", true);
-  if (!shift_quantization_enable)
+  const bool shift_quantization_enable = dmlc::GetEnv("MXNET_MKLDNN_SHIFT_QUANTIZATION", true);
+  if (!shift_quantization_enable) {
+    std::cout << "@@ shift quantization is disabled" << std::endl;
     return false;
+  } else {
+    std::cout << "@@ shift quantization is enabled!" << std::endl;
+  }
 
   for (auto &e: g_shift_conditions) {
-    //std::cout << "min: " << min << " vs " << e.first << ", max: " << max << " vs " << e.second << "." << std::endl;
+    std::cout << "min: " << min << " vs " << e.first << ", max: " << max << " vs " << e.second << "." << std::endl;
     //if ((std::abs(min - e.first) < DELTA) && (std::abs(max - e.second) < DELTA))
     if (IS_CLOSE(min, e.first) && IS_CLOSE(max, e.second))
       return true;
@@ -184,9 +250,9 @@ void SgMKLDNNFCOp::Forward(const OpContext &ctx,
       // calc shift * weight and cache it which will be required in compensation step.
       need_shift_ = check_if_need_shift(cached_min_data_, cached_max_data_);
       if (need_shift_) {
-        shift_ = 0.16997;
+        shift_ = 0.169972; // min is -0.169971x, make sure all the values are positive
         //shift_ = std::abs(cached_min_data_);
-        //std::cout << "@@ shift quantization (" << shift_ << ")." << std::endl;
+        std::cout << "@@ shift quantization (" << shift_ << ")." << std::endl;
         data_scale = kUint8Range / MaxAbs(0.0f, cached_max_data_ + shift_);
         data_revert_scale = MaxAbs(cached_min_data_, cached_max_data_) / data_range;
 
