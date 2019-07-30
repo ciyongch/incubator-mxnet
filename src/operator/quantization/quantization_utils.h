@@ -208,7 +208,6 @@ static inline bool check_if_need_shift(const float min, const float max) {
 
   for (auto &e: g_shift_conditions) {
     //std::cout << "min: " << min << " vs " << e.first << ", max: " << max << " vs " << e.second << "." << std::endl;
-    //if ((std::abs(min - e.first) < DELTA) && (std::abs(max - e.second) < DELTA))
     if (IS_CLOSE(min, e.first) && IS_CLOSE(max, e.second))
       return true;
   }

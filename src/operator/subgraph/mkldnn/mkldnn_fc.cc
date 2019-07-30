@@ -158,8 +158,9 @@ void SgMKLDNNFCOp::Forward(const OpContext &ctx,
       if (need_shift_) {
         CHECK(cached_min_data_ < 0)
           << "cached_min_data_=" << cached_min_data_ << ", which is expected to be negative.";
+        std::cout << "@@@ shift qfc" << std::endl;
 
-        data_scale = kUint8Range / (cached_max_data_ - cached_min_data);
+        data_scale = kUint8Range / (cached_max_data_ - cached_min_data_);
         shift_ = std::abs(cached_min_data_) * data_scale + 0.5;
         //std::cout << "@@ shift quantization (" << shift_ << ")." << std::endl;
 
@@ -175,10 +176,10 @@ void SgMKLDNNFCOp::Forward(const OpContext &ctx,
         weight_compensation_.resize(out_channel);
         float compensation_factor = shift_ / (data_scale * weight_scale);
         #pragma omp parallel for num_threads(engine::OpenMP::Get()->GetRecommendedOMPThreadCount())
-        for (index_t i = 0; i < static_cast<indext_t>(out_channel); ++i) {
+        for (index_t i = 0; i < static_cast<index_t>(out_channel); ++i) {
           int sum = 0;
           index_t offset = static_cast<index_t>(i * in_channel);
-          for (indext_t j = 0; j < static_cast<indext_t>(in_channel); ++j) {
+          for (index_t j = 0; j < static_cast<index_t>(in_channel); ++j) {
             sum += weight_ptr[offset + j];
           }
           weight_compensation_[i] = compensation_factor * sum;
