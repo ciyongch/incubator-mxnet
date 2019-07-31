@@ -74,8 +74,10 @@ class SgMKLDNNFCOp {
   float cached_min_output_;
   float cached_max_output_;
   bool need_shift_;
-  std::vector<float> weight_compensation_;
+  std::vector<int32_t> weight_compensation_;
   int32_t shift_;
+  NDArray int32_out_;
+  float factor_;
 };
 
 void SgMKLDNNFCOp::Forward(const OpContext &ctx,
@@ -173,7 +175,8 @@ void SgMKLDNNFCOp::Forward(const OpContext &ctx,
         size_t in_channel = wshape[1];
         int8_t* weight_ptr = weight.data().dptr<int8_t>();
         weight_compensation_.resize(out_channel);
-        float compensation_factor = (shift_ * 1.f) / (data_scale * weight_scale);
+        //float compensation_factor = (shift_ * 1.f) / (data_scale * weight_scale);
+        factor_ = 1.f / data_scale * weight_scale;
         #pragma omp parallel for num_threads(engine::OpenMP::Get()->GetRecommendedOMPThreadCount())
         for (index_t i = 0; i < static_cast<index_t>(out_channel); ++i) {
           int sum = 0;
@@ -181,7 +184,7 @@ void SgMKLDNNFCOp::Forward(const OpContext &ctx,
           for (index_t j = 0; j < static_cast<index_t>(in_channel); ++j) {
             sum += weight_ptr[offset + j];
           }
-          weight_compensation_[i] = compensation_factor * sum;
+          weight_compensation_[i] = shift_ * sum;
         }
       }
 
@@ -195,7 +198,11 @@ void SgMKLDNNFCOp::Forward(const OpContext &ctx,
       }
 
       if (mkldnn_param.enable_float_output) {
-        full_param_.output_scales[0] = 1.0 / data_scale / weight_scale;
+        if (need_shift_) {
+          full_param_.output_scales.resize(0);
+        } else {
+          full_param_.output_scales[0] = 1.0 / data_scale / weight_scale;
+        }
         full_param_.requantize_scales.resize(0);
       } else if (mkldnn_param.min_calib_range.has_value() &&
                  mkldnn_param.max_calib_range.has_value()) {
@@ -213,8 +220,22 @@ void SgMKLDNNFCOp::Forward(const OpContext &ctx,
       }
     }
 
-    fwd_.reset(new MKLDNNFullyConnectedForward(full_param_, ctx.is_train, data, weight,
-      (has_bias ? &cached_bias_ : nullptr), out_md));
+    if (need_shift_) {
+      mkldnn::memory::desc int32_out_md {
+        mkldnn::memory::dims(out_md.data.dims, out_md.data.dims + out_md.data.ndims),
+        get_mkldnn_type(mshadow::kInt32),
+        static_cast<mkldnn::memory::format>(out_md.data.format)};
+
+      mkldnn::memory::primitive_desc int32_out_mem_pd {int32_out_md, CpuEngine::Get()->get_engine()};
+      mkldnn_mem_ptr int32_mem(new mkldnn::memory(int32_out_mem_pd, nullptr));
+      MKLDNNStream::Get()->RegisterMem(int32_mem);
+      int32_out_ = NDArray(int32_mem);
+      fwd_.reset(new MKLDNNFullyConnectedForward(full_param_, ctx.is_train, data, weight,
+        (has_bias ? &cached_bias_ : nullptr), int32_out_md));
+    } else {
+      fwd_.reset(new MKLDNNFullyConnectedForward(full_param_, ctx.is_train, data, weight,
+        (has_bias ? &cached_bias_ : nullptr), out_md));
+    }
 
     // convert weight and bias to the format that MKL-DNN requires
     cached_weight_ = NDArray(fwd_->fwd_pd.weights_primitive_desc());
@@ -255,24 +276,32 @@ void SgMKLDNNFCOp::Forward(const OpContext &ctx,
   }
 
   auto data_mem = data.GetMKLDNNDataReorder(fwd_->fwd_pd.src_primitive_desc());
-  auto out_mem = CreateMKLDNNMem(output, fwd_->fwd_pd.dst_primitive_desc(),
-                                 req[fullc::kOut], &data);
-  fwd_->SetNewMem(*data_mem, *out_mem.second);
-
-  MKLDNNStream::Get()->RegisterPrim(fwd_->GetFwd());
-  CommitOutput(output, out_mem);
-  MKLDNNStream::Get()->Submit();
-
   if (need_shift_) {
+    auto temp_out_mem = int32_out_.GetMKLDNNData();
+    fwd_->SetNewMem(*data_mem, *temp_out_mem);
+
+    MKLDNNStream::Get()->RegisterPrim(fwd_->GetFwd());
+    MKLDNNStream::Get()->Submit();
+
     size_t num_batch = output.shape()[0];
     size_t num_channel = output.shape()[1];
+    int32_t* int32_out_ptr = reinterpret_cast<int32_t*>(temp_out_mem->get_data_handle());
     float* out_ptr = output.data().dptr<float>();
     #pragma omp parallel for num_threads(engine::OpenMP::Get()->GetRecommendedOMPThreadCount())
     for (index_t i = 0; i < static_cast<index_t>(num_batch); ++i) {
       for (index_t j = 0; j < static_cast<index_t>(num_channel); ++j) {
-        out_ptr[i * num_channel + j] -= weight_compensation_[j];
+        out_ptr[i * num_channel + j] =
+          static_cast<float>((int32_out_ptr[i *num_channel + j] - weight_compensation_[j]) * factor_);
       }
     }
+  } else {
+    auto out_mem = CreateMKLDNNMem(output, fwd_->fwd_pd.dst_primitive_desc(),
+                                   req[fullc::kOut], &data);
+    fwd_->SetNewMem(*data_mem, *out_mem.second);
+
+    MKLDNNStream::Get()->RegisterPrim(fwd_->GetFwd());
+    CommitOutput(output, out_mem);
+    MKLDNNStream::Get()->Submit();
   }
 
   if (mkldnn_param.quantized && !mkldnn_param.enable_float_output) {
