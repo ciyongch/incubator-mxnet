@@ -51,7 +51,7 @@ class SgMKLDNNQuantizeOperator {
   std::shared_ptr<mkldnn::memory> o_mem_;
   std::shared_ptr<mkldnn::reorder> fwd_pd_;
   bool need_shift_{false};
-  int32_t shift_{0};
+  float shift_{0.f};
   float scale_{0.f};
 };
 
@@ -135,7 +135,7 @@ void SgMKLDNNQuantizeOperator::Forward(const OpContext &ctx, const std::vector<N
       if (need_shift_) {
         real_range = data_max - data_min;
         scale_ = quantized_range / real_range;
-        shift_ = static_cast<int32_t>(Min(std::abs(data_min) * scale_ + 0.5f, quantized_range));
+        shift_ = std::abs(data_min);
       } else {
         float scale = quantized_range / real_range;
         primitive_attr attr;
@@ -175,8 +175,7 @@ void SgMKLDNNQuantizeOperator::Forward(const OpContext &ctx, const std::vector<N
       #pragma omp parallel for num_threads(engine::OpenMP::Get()->GetRecommendedOMPThreadCount())
       for (index_t i = 0; i < static_cast<index_t>(input_size); ++i) {
         //output_ptr[i] = static_cast<uint8_t>(Min(input_ptr[i] * scale_ + shift_ + 0.5f, quantized_range));
-        output_ptr[i] = static_cast<uint8_t>(Min(Sign(input_ptr[i]) *
-            (std::abs(input_ptr[i]) * scale_ + 0.5f) + shift_, quantized_range));
+        output_ptr[i] = static_cast<uint8_t>(Min((input_ptr[i] + shift_) * scale_ + 0.5f, quantized_range));
       }
     } else {
       auto o_mem = CreateMKLDNNMem(outputs[0], o_mem_->get_primitive_desc(), req[0]);
