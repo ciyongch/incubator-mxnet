@@ -135,7 +135,7 @@ void SgMKLDNNQuantizeOperator::Forward(const OpContext &ctx, const std::vector<N
       if (need_shift_) {
         real_range = data_max - data_min;
         scale_ = quantized_range / real_range;
-        shift_ = std::abs(data_min) * scale_ + 0.5;
+        shift_ = static_cast<int32_t>(Min(std::abs(data_min) * scale_ + 0.5f, quantized_range));
       } else {
         float scale = quantized_range / real_range;
         primitive_attr attr;
@@ -174,7 +174,9 @@ void SgMKLDNNQuantizeOperator::Forward(const OpContext &ctx, const std::vector<N
       auto output_ptr = outputs[0].data().dptr<uint8_t>();
       #pragma omp parallel for num_threads(engine::OpenMP::Get()->GetRecommendedOMPThreadCount())
       for (index_t i = 0; i < static_cast<index_t>(input_size); ++i) {
-        output_ptr[i] = static_cast<uint8_t>(input_ptr[i] * scale_ + shift_ + 0.5);
+        //output_ptr[i] = static_cast<uint8_t>(Min(input_ptr[i] * scale_ + shift_ + 0.5f, quantized_range));
+        output_ptr[i] = static_cast<uint8_t>(Min(Sign(input_ptr[i]) *
+            (std::abs(input_ptr[i]) * scale_ + 0.5f) + shift_, quantized_range));
       }
     } else {
       auto o_mem = CreateMKLDNNMem(outputs[0], o_mem_->get_primitive_desc(), req[0]);
