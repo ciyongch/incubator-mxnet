@@ -44,6 +44,7 @@
 #include "./openmp.h"
 #include "../common/object_pool.h"
 #include "../profiler/custom_op_profiler.h"
+#include "../../src/common/library.h"
 
 namespace mxnet {
 namespace engine {
@@ -331,6 +332,10 @@ class ThreadedEngine : public Engine {
       kill_.store(true);
     }
     finished_cv_.notify_all();
+    // close opened libraries
+    for (auto const& lib : loaded_libs) {
+      close_lib(lib.second);
+    }
   }
 
  protected:
@@ -359,7 +364,7 @@ class ThreadedEngine : public Engine {
       const Context& ctx = opr_block->ctx;
       opr_block->opr_profile.reset(new profiler::ProfileOperator(threaded_opr->opr_name,
                                                                  attrs.release()));
-      opr_block->opr_profile->start(ctx.dev_type, ctx.dev_id);
+      opr_block->opr_profile->startForDevice(ctx.dev_type, ctx.dev_id);
     }
     CallbackOnComplete callback =
         this->CreateCallback(ThreadedEngine::OnCompleteStatic, opr_block);

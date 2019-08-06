@@ -227,6 +227,13 @@ MXNET_DLL const char *MXGetLastError();
 //-------------------------------------
 
 /*!
+ * \brief Load library dynamically
+ * \param path to the library .so file
+ * \return 0 when success, -1 when failure happens.
+ */
+MXNET_DLL int MXLoadLib(const char *path);
+
+/*!
  * \brief Get list of features supported on the runtime
  * \param libFeature pointer to array of LibFeature
  * \param size of the array
@@ -505,6 +512,15 @@ MXNET_DLL int MXGetGPUMemoryInformation64(int dev, uint64_t *free_mem, uint64_t 
  * \return 0 when success, -1 when failure happens
  */
 MXNET_DLL int MXGetVersion(int *out);
+
+/*!
+ * \brief Load TVM operator from the binary library
+ * \param libpath TVM operators lib file
+ * \return 0 when success, -1 when failure happens
+ */
+#if MXNET_USE_TVM_OP
+MXNET_DLL int MXLoadTVMOp(const char *libpath);
+#endif  // MXNET_USE_TVM_OP
 
 
 //-------------------------------------
