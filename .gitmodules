@@ -15,8 +15,8 @@
 	url = https://github.com/google/googletest.git
 [submodule "3rdparty/mkldnn"]
 	path = 3rdparty/mkldnn
-	url = https://github.com/taolv/mkl-dnn.git
-	branch = master
+	url = ssh://git@gitlab.devtools.intel.com:29418/ipl/dl/mkl-dnn.git
+	branch = mnt-v0
 [submodule "3rdparty/tvm"]
 	path = 3rdparty/tvm
 	url = https://github.com/dmlc/tvm
