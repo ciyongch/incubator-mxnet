@@ -117,6 +117,11 @@ Example::
 .set_attr<bool>("TIsMKLDNN", true)
 .set_attr<FComputeEx>("FComputeEx<cpu>", SoftmaxComputeExCPU)
 .set_attr<FInferStorageType>("FInferStorageType", SoftmaxStorageType)
+#else
+.set_attr<nnvm::FInplaceOption>("FInplaceOption",
+  [](const NodeAttrs& attrs){
+    return std::vector<std::pair<int, int> >{{0, 0}};
+  })
 #endif
 .set_attr<nnvm::FGradient>("FGradient", SoftmaxFGradient{"_backward_softmax"})
 // .set_attr<nnvm::FGradient>("FGradient", MakeZeroGradNodes)
@@ -127,10 +132,6 @@ Example::
   })
 .set_num_outputs(1)
 .set_attr<mxnet::FInferShape>("FInferShape", SoftmaxOpShape)
-.set_attr<nnvm::FInplaceOption>("FInplaceOption",
-  [](const NodeAttrs& attrs){
-    return std::vector<std::pair<int, int> >{{0, 0}};
-  })
 .add_argument("data", "NDArray-or-Symbol", "The input array.")
 .add_argument("length", "NDArray-or-Symbol", "The length array.")
 .add_arguments(SoftmaxParam::__FIELDS__());
