@@ -65,6 +65,7 @@ class SgMKLDNNFCOp {
   std::shared_ptr<MKLDNNFullyConnectedForward> fwd_;
   NDArray cached_weight_;
   NDArray cached_bias_;
+  std::shared_ptr<mkldnn::memory> cached_out_mem_;
   float cached_min_data_;
   float cached_max_data_;
   float cached_min_weight_;
@@ -74,6 +75,27 @@ class SgMKLDNNFCOp {
   float cached_min_output_;
   float cached_max_output_;
 };
+
+void MKLDNNFCFlattenData(const FullyConnectedParam &param,
+                         const NDArray &out_data,
+                         NDArray *in_data) {
+  const mxnet::TShape ishape = in_data->shape();
+  const mxnet::TShape oshape = out_data.shape();
+
+  // If the input data is a view of an MKLDNN array, we should create a new
+  // NDArray with reordered data.
+  if (in_data->IsMKLDNNData() && in_data->IsView())
+    *in_data = in_data->Reorder2Default();
+
+  if (ishape.ndim() != 2) {
+    if (!param.flatten) {
+      *in_data = in_data->MKLDNNDataReshape(Shape2(ishape.ProdShape(0, ishape.ndim()-1),
+                                                    ishape[ishape.ndim()-1]));
+    } else {
+      *in_data = in_data->MKLDNNDataReshape(Shape2(ishape[0], ishape.ProdShape(1, ishape.ndim())));
+    }
+  }
+}
 
 void SgMKLDNNFCOp::Forward(const OpContext &ctx,
                            const std::vector<NDArray> &in_data,
@@ -112,11 +134,9 @@ void SgMKLDNNFCOp::Forward(const OpContext &ctx,
   CHECK_EQ(out_data.size(), total_num_outputs);
 
   NDArray data = in_data[fullc::kData];
-  NDArray weight = in_data[fullc::kWeight];
   NDArray output = out_data[fullc::kOut];
 
-  mkldnn::memory::desc out_md = GetMemDesc(output);
-  MKLDNNFCFlattenData(default_param, out_data[fullc::kOut], &data, &out_md);
+  MKLDNNFCFlattenData(default_param, output, &data);
 
   if (initialized_ && mkldnn_param.quantized) {
     if (cached_min_data_ != min_data || cached_max_data_ != max_data ||
@@ -128,6 +148,7 @@ void SgMKLDNNFCOp::Forward(const OpContext &ctx,
 
   // TODO, check cached_weight_ and cached_bias_
   if (!initialized_) {
+    NDArray weight = in_data[fullc::kWeight];
     cached_min_data_ = min_data;
     cached_max_data_ = max_data;
     cached_min_weight_ = min_weight;
@@ -141,6 +162,27 @@ void SgMKLDNNFCOp::Forward(const OpContext &ctx,
     } else {
       cached_bias_ = NDArray();
     }
+
+    // create cached out_md
+    const mxnet::TShape ishape = data.shape();
+    const mxnet::TShape oshape = output.shape();
+    mkldnn::memory::dims out_dims (2);
+    if (oshape.ndim() == 2) {
+      out_dims[0] = static_cast<int>(oshape[0]);
+      out_dims[1] = static_cast<int>(oshape[1]);
+    } else {
+      if (!default_param.flatten) {
+        out_dims[0] = static_cast<int>(oshape.ProdShape(0, oshape.ndim()-1));
+        out_dims[1] = static_cast<int>(oshape[oshape.ndim()-1]);
+      } else {
+        out_dims[0] = static_cast<int>(static_cast<int>(oshape[0]));
+        out_dims[1] = static_cast<int>(oshape.ProdShape(1, oshape.ndim()));
+      }
+    }
+    mkldnn::memory::desc out_md = mkldnn::memory::desc(out_dims, get_mkldnn_type(output.dtype()),
+      static_cast<mkldnn::memory::format>(GetDefaultFormat(2)));
+    mkldnn::memory::primitive_desc out_mem_pd {out_md, CpuEngine::Get()->get_engine()};
+    cached_out_mem_ = std::make_shared<mkldnn::memory>(out_mem_pd, nullptr);
 
     if (mkldnn_param.quantized) {
       CHECK(data.dtype() == mshadow::kInt8 || data.dtype() == mshadow::kUint8);
@@ -218,13 +260,28 @@ void SgMKLDNNFCOp::Forward(const OpContext &ctx,
     initialized_ = true;
   }
 
-  auto data_mem = data.GetMKLDNNDataReorder(fwd_->fwd_pd.src_primitive_desc());
-  auto out_mem = CreateMKLDNNMem(output, fwd_->fwd_pd.dst_primitive_desc(),
-                                 req[fullc::kOut], &data);
-  fwd_->SetNewMem(*data_mem, *out_mem.second);
+  if (data.IsMKLDNNData())
+    data = data.Reorder2Default();
+  auto data_mem = data.GetMKLDNNData();
+  mkldnn_output_t out_mem;
+  if (req[fullc::kOut] == kWriteTo) {
+    // update out mem ptr to cached_output_
+    MSHADOW_TYPE_SWITCH(output.dtype(), DType, {
+      cached_out_mem_->set_data_handle(reinterpret_cast<void *>(output.data().dptr<DType>()));
+    });
+    fwd_->SetNewMem(*data_mem, *cached_out_mem_);
+  } else {
+    out_mem = CreateMKLDNNMem(output, fwd_->fwd_pd.dst_primitive_desc(),
+                              req[fullc::kOut], &data);
+    if (req[fullc::kOut] != kWriteTo) {
+      fwd_->SetNewMem(*data_mem, *out_mem.second);
+    }
+  }
 
   MKLDNNStream::Get()->RegisterPrim(fwd_->GetFwd());
-  CommitOutput(output, out_mem);
+  if (req[fullc::kOut] != kWriteTo) {
+    CommitOutput(output, out_mem);
+  }
   MKLDNNStream::Get()->Submit();
 
   if (mkldnn_param.quantized && !mkldnn_param.enable_float_output) {
