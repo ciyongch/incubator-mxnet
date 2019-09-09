@@ -102,15 +102,15 @@ void SgMKLDNNFatFCOp::Forward(const OpContext &ctx, const std::vector<NDArray> &
     mkldnn::memory::dims out_dims(2);
     out_dims[0] = num_batch;
     out_dims[1] = 0;
+    std::vector<size_t> weight_channels(num_fc, 0);
+    for (size_t i = 0; i < num_fc; i++) {
+      const auto &weight = in_data[i * base_num_inputs + fullc::kWeight];
+      weight_channels[i] = weight.shape()[0];
+      out_dims[1] += weight_channels[i];
+    }
 
     float min_data = std::numeric_limits<float>::max();
     float max_data = std::numeric_limits<float>::min();
-    float min_weight = std::numeric_limits<float>::max();
-    float max_weight = std::numeric_limits<float>::min();
-    float min_bias = std::numeric_limits<float>::max();
-    float max_bias = std::numeric_limits<float>::min();
-
-    std::vector<NDArray> rescaled_weight;
     std::vector<NDArray> rescaled_bias;
     if (mkldnn_param.quantized) {
       std::vector<float> weight_scales(num_fc, 0.f);
@@ -131,8 +131,6 @@ void SgMKLDNNFatFCOp::Forward(const OpContext &ctx, const std::vector<NDArray> &
                                          .data()
                                          .dptr<float>()[0];
         weight_scales[i] = kInt8Range / MaxAbs(this_weight_min, this_weight_max);
-        if (this_weight_min < min_weight) min_weight = this_weight_min;
-        if (this_weight_max > max_weight) max_weight = this_weight_max;
         if (has_bias) {
           const auto this_bias_min = in_data[base_num_inputs * num_fc + base_min_max_inputs * i +
                                              quantized_fullc::kBiasMin]
@@ -143,55 +141,46 @@ void SgMKLDNNFatFCOp::Forward(const OpContext &ctx, const std::vector<NDArray> &
                                          .data()
                                          .dptr<float>()[0];
           bias_scales[i] = kInt8Range / MaxAbs(this_bias_min, this_bias_max);
-          if (this_bias_min < min_bias) min_bias = this_bias_min;
-          if (this_bias_max > max_bias) max_bias = this_bias_max;
         }
       }
       CHECK(data.dtype() == mshadow::kInt8 || data.dtype() == mshadow::kUint8);
       auto data_range = (data.dtype() == mshadow::kInt8) ? kInt8Range : kUint8Range;
       float data_scale = data_range / MaxAbs(min_data, max_data);
-      float weight_scale = kInt8Range / MaxAbs(min_weight, max_weight);
-      float bias_scale = has_bias ? kInt8Range / MaxAbs(min_bias, max_bias) : 0.f;
       float quantized_out_range = kInt8Range;
       if (mkldnn_param.enable_float_output) {
-        full_param_.output_scales[0] = 1.0 / data_scale / weight_scale;
+        full_param_.output_scales.clear();
+        for (size_t i = 0; i < num_fc; i++) {
+          for (size_t j = 0; j < weight_channels[i]; j++) {
+            full_param_.output_scales.push_back(1.0 / data_scale / weight_scales[i]);
+          }
+        }
         full_param_.requantize_scales.resize(0);
       } else if (mkldnn_param.min_calib_range.has_value() &&
                  mkldnn_param.max_calib_range.has_value()) {
         full_param_.output_scales.resize(0);
         cached_min_output_ = mkldnn_param.min_calib_range.value();
         cached_max_output_ = mkldnn_param.max_calib_range.value();
-
-        full_param_.requantize_scales[0] = quantized_out_range /
-                                           MaxAbs(cached_min_output_, cached_max_output_) /
-                                           data_scale / weight_scale;
-      } else {
-        Stream<cpu> *s = ctx.get_stream<cpu>();
-        mxnet_op::Kernel<QuantizationRangeForS8S8MultiplicationStruct, cpu>::Launch(
-            s, 1, &cached_min_output_, &cached_max_output_, &min_data, &max_data, &min_weight,
-            &max_weight);
-      }
-      // Rescale all weights
-      rescaled_weight.resize(num_fc);
-      for (size_t i = 0; i < num_fc; i++) {
-        const float weight_rescale = weight_scale / weight_scales[i];
-        const auto &weight = in_data[i * base_num_inputs + fullc::kWeight];
-        rescaled_weight[i] =
-            NDArray(weight.storage_type(), weight.shape(), weight.ctx(), true, mshadow::kInt8);
-        int8_t *weight_ptr = weight.data().dptr<int8_t>();
-        int8_t *quantized_weight_ptr = rescaled_weight[i].data().dptr<int8_t>();
-        size_t weight_size = weight.shape().Size();
-#pragma omp parallel for num_threads(engine::OpenMP::Get()->GetRecommendedOMPThreadCount())
-        for (index_t j = 0; j < static_cast<index_t>(weight_size); ++j) {
-          quantized_weight_ptr[j] = std::round(weight_ptr[j] * weight_rescale);
+        full_param_.requantize_scales.clear();
+        for (size_t i = 0; i < num_fc; i++) {
+          for (size_t j = 0; j < weight_channels[i]; j++) {
+            full_param_.requantize_scales.push_back(quantized_out_range /
+                                                    MaxAbs(cached_min_output_, cached_max_output_) /
+                                                    data_scale / weight_scales[i]);
+          }
         }
+      } else {
+        LOG(FATAL) << "per channel scale doesn't support non calibration mode.";
+        // Stream<cpu> *s = ctx.get_stream<cpu>();
+        // mxnet_op::Kernel<QuantizationRangeForS8S8MultiplicationStruct, cpu>::Launch(
+        //     s, 1, &cached_min_output_, &cached_max_output_, &min_data, &max_data, &min_weight,
+        //     &max_weight);
       }
 
       if (has_bias) {
-        float bias_int32_rescale = data_scale * weight_scale / bias_scale;
+        // Rescale all bias
         rescaled_bias.resize(num_fc);
         for (size_t i = 0; i < num_fc; i++) {
-          const float bias_rescale = bias_scale / bias_scales[i];
+          const float bias_rescale = data_scale * weight_scales[i] / bias_scales[i];
           const auto &bias = in_data[i * base_num_inputs + fullc::kBias];
           rescaled_bias[i] =
               NDArray(bias.storage_type(), bias.shape(), bias.ctx(), true, mshadow::kInt32);
@@ -200,35 +189,33 @@ void SgMKLDNNFatFCOp::Forward(const OpContext &ctx, const std::vector<NDArray> &
           size_t bias_size = bias.shape().Size();
 #pragma omp parallel for num_threads(engine::OpenMP::Get()->GetRecommendedOMPThreadCount())
           for (index_t j = 0; j < static_cast<index_t>(bias_size); ++j) {
-            quantized_bias_ptr[j] = std::round(bias_ptr[j] * bias_rescale * bias_int32_rescale);
+            quantized_bias_ptr[j] = std::round(bias_ptr[j] * bias_rescale);
           }
         }
       }
     }
     // Concat weight
-    std::shared_ptr<mkldnn::memory> concated_weight;
+    std::shared_ptr<mkldnn::memory> concatted_weight;
     {
       std::vector<mkldnn::memory::primitive_desc> weight_md;
       std::vector<mkldnn::primitive::at> weight_mem;
       weight_md.reserve(num_fc);
       weight_mem.reserve(num_fc);
       for (size_t i = 0; i < num_fc; i++) {
-        const auto &weight = mkldnn_param.quantized ? rescaled_weight[i]
-                                                    : in_data[i * base_num_inputs + fullc::kWeight];
+        const auto &weight = in_data[i * base_num_inputs + fullc::kWeight];
         const mkldnn::memory *mem = weight.GetMKLDNNData();
         const mkldnn::memory::primitive_desc weight_pd = mem->get_primitive_desc();
         weight_md.push_back(weight_pd);
         weight_mem.push_back(*mem);
-        out_dims[1] += weight.shape()[0];
       }
       const mkldnn::concat::primitive_desc concat_pd(0, weight_md);
-      concated_weight = std::make_shared<mkldnn::memory>(concat_pd.dst_primitive_desc());
-      MKLDNNStream::Get()->RegisterPrim(mkldnn::concat(concat_pd, weight_mem, *concated_weight));
+      concatted_weight = std::make_shared<mkldnn::memory>(concat_pd.dst_primitive_desc());
+      MKLDNNStream::Get()->RegisterPrim(mkldnn::concat(concat_pd, weight_mem, *concatted_weight));
       MKLDNNStream::Get()->Submit();
     }
 
     // Concat bias
-    std::shared_ptr<mkldnn::memory> concated_bias;
+    std::shared_ptr<mkldnn::memory> concatted_bias;
     if (has_bias) {
       std::vector<mkldnn::memory::primitive_desc> bias_md;
       std::vector<mkldnn::primitive::at> bias_mem;
@@ -243,8 +230,8 @@ void SgMKLDNNFatFCOp::Forward(const OpContext &ctx, const std::vector<NDArray> &
         bias_mem.push_back(*mem);
       }
       const mkldnn::concat::primitive_desc concat_pd(0, bias_md);
-      concated_bias = std::make_shared<mkldnn::memory>(concat_pd.dst_primitive_desc());
-      MKLDNNStream::Get()->RegisterPrim(mkldnn::concat(concat_pd, bias_mem, *concated_bias));
+      concatted_bias = std::make_shared<mkldnn::memory>(concat_pd.dst_primitive_desc());
+      MKLDNNStream::Get()->RegisterPrim(mkldnn::concat(concat_pd, bias_mem, *concatted_bias));
       MKLDNNStream::Get()->Submit();
     }
     MKLDNNFCFullParam param;
@@ -252,8 +239,8 @@ void SgMKLDNNFatFCOp::Forward(const OpContext &ctx, const std::vector<NDArray> &
     param.mkldnn_param = mkldnn_param;
     param.output_scales = full_param_.output_scales;
     param.requantize_scales = full_param_.requantize_scales;
-    NDArray weight = NDArray(concated_weight);
-    NDArray bias = has_bias ? NDArray(concated_bias) : NDArray();
+    NDArray weight = NDArray(concatted_weight);
+    NDArray bias = has_bias ? NDArray(concatted_bias) : NDArray();
     const auto &output = out_data[fullc::kData];
     mkldnn::memory::desc out_md(out_dims, get_mkldnn_type(output.dtype()),
                                 mkldnn::memory::format::any);
@@ -263,10 +250,10 @@ void SgMKLDNNFatFCOp::Forward(const OpContext &ctx, const std::vector<NDArray> &
     cached_output_ = std::make_shared<mkldnn::memory>(fc_pd.dst_primitive_desc(), nullptr);
     // convert weight and bias to the format that MKL-DNN requires
     cached_weight_ = std::make_shared<mkldnn::memory>(fc_pd.weights_primitive_desc());
-    MKLDNNStream::Get()->RegisterPrim(mkldnn::reorder(*concated_weight, *cached_weight_));
+    MKLDNNStream::Get()->RegisterPrim(mkldnn::reorder(*concatted_weight, *cached_weight_));
     if (has_bias) {
       cached_bias_ = std::make_shared<mkldnn::memory>(fc_pd.bias_primitive_desc());
-      MKLDNNStream::Get()->RegisterPrim(mkldnn::reorder(*concated_bias, *cached_bias_));
+      MKLDNNStream::Get()->RegisterPrim(mkldnn::reorder(*concatted_bias, *cached_bias_));
     }
     MKLDNNStream::Get()->Submit();
     if (has_bias) {
@@ -332,16 +319,23 @@ static bool SgMKLDNNFatFCInferShape(const nnvm::NodeAttrs &attrs, mxnet::ShapeVe
       base_out_shapes.push_back(out_shapes->at(0));
     }
     bool ret = DefaultSubgraphOpShape(attrs, &base_in_shapes, &base_out_shapes);
-    for (size_t i = 1; i < num_fc; i++) {
-      base_out_shapes[0][1] += base_out_shapes[i][1];
-    }
     for (size_t i = 0; i < in_shapes->size(); ++i) {
       if (i < base_in_shapes.size())
         in_shapes->at(i) = base_in_shapes[i];
       else
         SHAPE_ASSIGN_CHECK(*in_shapes, i, Shape1(1));
     }
-    out_shapes->at(0) = base_out_shapes[0];
+    size_t base_ndim = base_out_shapes[0].ndim();
+    mxnet::TShape new_out_shape(base_ndim + 1, -1);
+    size_t j = 0;
+    for (size_t i = 0; i < base_ndim + 1; i++) {
+      if (i != base_ndim - 1) {
+        new_out_shape[i] = base_out_shapes[0][j++];
+      } else {
+        new_out_shape[i] = num_fc;
+      }
+    }
+    out_shapes->at(0) = new_out_shape;
     for (size_t i = 1; i < out_shapes->size(); ++i) {
       SHAPE_ASSIGN_CHECK(*out_shapes, i, Shape1(1));
     }
@@ -350,12 +344,20 @@ static bool SgMKLDNNFatFCInferShape(const nnvm::NodeAttrs &attrs, mxnet::ShapeVe
     mxnet::ShapeVector base_out_shapes;
     for (size_t i = 0; i < num_fc; i++) {
       base_out_shapes.push_back(out_shapes->at(0));
+
     }
     bool ret = DefaultSubgraphOpShape(attrs, in_shapes, &base_out_shapes);
-    for (size_t i = 1; i < num_fc; i++) {
-      base_out_shapes[0][1] += base_out_shapes[i][1];
+    size_t base_ndim = base_out_shapes[0].ndim();
+    mxnet::TShape new_out_shape(base_ndim + 1, -1);
+    size_t j = 0;
+    for (size_t i = 0; i < base_ndim + 1; i++) {
+      if (i != base_ndim - 1) {
+        new_out_shape[i] = base_out_shapes[0][j++];
+      } else {
+        new_out_shape[i] = num_fc;
+      }
     }
-    out_shapes->at(0) = base_out_shapes[0];
+    out_shapes->at(0) = new_out_shape;
     return ret;
   }
 }
