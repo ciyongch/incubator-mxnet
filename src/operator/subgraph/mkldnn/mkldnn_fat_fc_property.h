@@ -50,14 +50,16 @@ class SgMKLDNNFatFCSelector : public SubgraphSelectorV2 {
   };
 
  private:
+  bool disable_ = false;
   const BiDirectedNode *data_ = nullptr;
   std::vector<const BiDirectedNode *> matched_fc_;
   std::vector<const BiDirectedNode *> fc_consumer_;
 
  public:
-  explicit SgMKLDNNFatFCSelector() {}
+  explicit SgMKLDNNFatFCSelector(bool disable) : disable_(disable) {}
 
   bool Select(const BiDirectedNode &sn) override {
+    if (disable_) return false;
     const auto &n = *sn.node;
     if (n.op() == Op::Get("FullyConnected")) {
       matched_fc_.clear();
@@ -107,7 +109,7 @@ class SgMKLDNNFatFCSelector : public SubgraphSelectorV2 {
 
   void Reset() override {
     CHECK_GE(matched_fc_.size(), 1);
-    auto new_selector = SgMKLDNNFatFCSelector();
+    auto new_selector = SgMKLDNNFatFCSelector(disable_);
     new_selector.Select(*matched_fc_[0]);
     *this = new_selector;
   }
@@ -122,11 +124,11 @@ class SgMKLDNNFatFCProperty : public SubgraphProperty {
 
   static SubgraphPropertyPtr Create() {
     static const std::string &name = "MKLDNN Fat FullyConnected optimization pass";
-    if (dmlc::GetEnv("MXNET_DISABLE_MKLDNN_FC_OPT", 0)) {
-      LOG(INFO) << name << " is disabled.";
-      return nullptr;
-    }
     auto property = std::make_shared<SgMKLDNNFatFCProperty>();
+    if (dmlc::GetEnv("MXNET_DISABLE_MKLDNN_FAT_FC_OPT", 0)) {
+      LOG(INFO) << name << " is disabled.";
+      property->SetAttr<bool>("disable", true);
+    }
     property->SetAttr<std::string>("property_name", name);
     property->SetAttr<bool>("inference_only", true);
     return property;
@@ -168,8 +170,8 @@ class SgMKLDNNFatFCProperty : public SubgraphProperty {
     split->attrs.name = split_name.str();
     split->attrs.op = Op::Get("split");
     split->attrs.dict["num_outputs"] = std::to_string(matched_fc.size());
-    split->attrs.dict["axis"] = "1";
-
+    split->attrs.dict["axis"] = "-2";
+    split->attrs.dict["squeeze_axis"] = "1";
     split->inputs.emplace_back(n, 0, 0);
     const auto &outputs = selector_ptr->GetOutputs();
     for (auto out : outputs) {
@@ -186,7 +188,11 @@ class SgMKLDNNFatFCProperty : public SubgraphProperty {
   }
 
   SubgraphSelectorV2Ptr CreateSubgraphSelectorV2() const override {
-    auto selector = std::make_shared<SgMKLDNNFatFCSelector>();
+    bool disable = false;
+    if (HasAttr("disable")) {
+      disable = GetAttr<bool>("disable");
+    }
+    auto selector = std::make_shared<SgMKLDNNFatFCSelector>(disable);
     return selector;
   }
 };
