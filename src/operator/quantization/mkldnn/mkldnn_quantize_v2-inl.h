@@ -34,6 +34,24 @@
 namespace mxnet {
 namespace op {
 
+#ifndef CACHELINE_SIZE
+# define CACHELINE_SIZE 64
+#endif
+
+#ifndef BYTE256_ALIGNED
+# ifndef FOURLINE_ALIGNED
+#  define MULTIPLE_CACHE_ALIGNED(factor) __attribute__ ((aligned ((factor)*CACHELINE_SIZE))) 
+#  define FOURLINE_ALIGNED MULTIPLE_CACHE_ALIGNED(4)
+# endif
+# define BYTE256_ALIGNED FOURLINE_ALIGNED
+#endif
+
+struct aligned_float {
+  public:
+  float volatile BYTE256_ALIGNED item;
+};
+
+
 class SgMKLDNNQuantizeOperator {
  public:
   explicit SgMKLDNNQuantizeOperator(const nnvm::NodeAttrs &attrs)
@@ -59,6 +77,10 @@ void SgMKLDNNQuantizeOperator::Forward(const OpContext &ctx, const std::vector<N
   NDArray in_buffer = inputs[0];
   float data_min = mshadow::red::limits::MaxValue<float>();
   float data_max = mshadow::red::limits::MinValue<float>();
+
+  aligned_float aligned_data_min, aligned_data_max;
+  aligned_data_min.item = data_min;
+  aligned_data_max.item = data_max;
 
   // Pass through quantized data
   if (inputs[0].dtype() == mshadow::kUint8 || inputs[0].dtype() == mshadow::kInt8) {
@@ -90,17 +112,17 @@ void SgMKLDNNQuantizeOperator::Forward(const OpContext &ctx, const std::vector<N
       in_buffer = inputs[0].Reorder2Default();
       auto in_ptr = in_buffer.data().dptr<float>();
       auto nthreads = engine::OpenMP::Get()->GetRecommendedOMPThreadCount();
-      std::vector<float> data_maxs(nthreads, data_max);
-      std::vector<float> data_mins(nthreads, data_min);
+      std::vector<aligned_float> data_maxs(nthreads, aligned_data_max);
+      std::vector<aligned_float> data_mins(nthreads, aligned_data_min);
 #pragma omp parallel for num_threads(nthreads)
       for (index_t i = 0; i < static_cast<index_t>(in_buffer.shape().Size()); i++) {
         int tid = omp_get_thread_num();
-        if (in_ptr[i] > data_maxs[tid]) data_maxs[tid] = in_ptr[i];
-        if (in_ptr[i] < data_mins[tid]) data_mins[tid] = in_ptr[i];
+        if (in_ptr[i] > data_maxs[tid].item) data_maxs[tid].item = in_ptr[i];
+        if (in_ptr[i] < data_mins[tid].item) data_mins[tid].item = in_ptr[i];
       }
       for (index_t i = 0; i < nthreads; i++) {
-        if (data_maxs[i] > data_max) data_max = data_maxs[i];
-        if (data_mins[i] < data_min) data_min = data_mins[i];
+        if (data_maxs[i].item > data_max) data_max = data_maxs[i].item;
+        if (data_mins[i].item < data_min) data_min = data_mins[i].item;
       }
 
       if (initalized_ && (cached_data_min_ != data_min || cached_data_max_ != data_max))

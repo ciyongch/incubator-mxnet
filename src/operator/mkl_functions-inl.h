@@ -121,6 +121,25 @@ MSHADOW_XINLINE static void sum_(index_t n, DType *in, DType *dst) {
   dst[0] = sum;
 }
 
+
+#ifndef CACHELINE_SIZE
+# define CACHELINE_SIZE 64
+#endif
+
+#ifndef BYTE256_ALIGNED
+# ifndef FOURLINE_ALIGNED
+#  define MULTIPLE_CACHE_ALIGNED(factor) __attribute__ ((aligned ((factor)*CACHELINE_SIZE))) 
+#  define FOURLINE_ALIGNED MULTIPLE_CACHE_ALIGNED(4)
+# endif
+# define BYTE256_ALIGNED FOURLINE_ALIGNED
+#endif
+
+template <typename DType>
+struct aligned_dtype {
+  public:
+  DType volatile BYTE256_ALIGNED item;
+};
+
 // LayerNorm on the last dimension
 template <typename DType>
 MSHADOW_XINLINE static void LayerNormLastDim(index_t m,
@@ -133,6 +152,9 @@ MSHADOW_XINLINE static void LayerNormLastDim(index_t m,
                                              DType *var,
                                              DType eps) {
   auto nthreads = engine::OpenMP::Get()->GetRecommendedOMPThreadCount();
+
+  std::vector<aligned_dtype<DType> > aligned_mean(m);
+  std::vector<aligned_dtype<DType> > aligned_var(m);
 #pragma omp parallel for num_threads(nthreads)
   for (index_t i = 0; i < m; i++) {
     DType* in_offset = a + i * n;
@@ -147,15 +169,23 @@ MSHADOW_XINLINE static void LayerNormLastDim(index_t m,
       x_sum += in_offset[j];
       x_square_sum += in_offset[j] * in_offset[j];
     }
-    mean[i] = x_sum / n;
-    var[i] = math::sqrt(x_square_sum / n - mean[i] * mean[i] + eps);
+    DType mean_ = x_sum / n;
+    DType var_ = math::sqrt(x_square_sum / n - mean_ * mean_ + eps);
 
 #if !defined(_MSC_VER)
 #pragma omp simd
 #endif
     for (index_t j = 0; j < n; j++) {
-      out_offset[j] = (in_offset[j] - mean[i]) * gamma[j] / var[i] + beta[j];
+      out_offset[j] = (in_offset[j] - mean_) * gamma[j] / var_ + beta[j];
     }
+
+    aligned_mean[i].item = mean_;
+    aligned_var[i].item = var_;
+  }
+
+  for (index_t i = 0; i < m; i++) {
+    mean[i] = aligned_mean[i].item;
+    var[i] = aligned_var[i].item;
   }
 }
 
