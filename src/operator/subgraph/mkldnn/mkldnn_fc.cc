@@ -66,6 +66,7 @@ class SgMKLDNNFCOp {
   NDArray cached_weight_;
   NDArray cached_bias_;
   std::shared_ptr<mkldnn::memory> cached_out_mem_;
+  std::shared_ptr<mkldnn::memory> cached_data_mem_;
   float cached_min_data_;
   float cached_max_data_;
   float cached_min_weight_;
@@ -130,6 +131,7 @@ void SgMKLDNNFCOp::Forward(const OpContext &ctx,
       total_num_outputs = base_num_outputs * 3;
     }
   }
+
   CHECK_EQ(in_data.size(), total_num_inputs);
   CHECK_EQ(out_data.size(), total_num_outputs);
 
@@ -254,34 +256,30 @@ void SgMKLDNNFCOp::Forward(const OpContext &ctx,
         bias_reorder_pd, *def_bias_mem, *cached_bias_mem));
     }
 
+    if (data.IsMKLDNNData())
+      data = data.Reorder2Default();
+    auto data_mem = data.GetMKLDNNData();
+    cached_data_mem_ = std::make_shared<mkldnn::memory>(data_mem->get_primitive_desc(), nullptr);
+
     fwd_->SetNewMem(*data.GetMKLDNNData(), *cached_weight_.GetMKLDNNData(),
                     has_bias ? cached_bias_.GetMKLDNNData() : nullptr,
                     *output.GetMKLDNNData());
     initialized_ = true;
   }
 
-  if (data.IsMKLDNNData())
+  if (data.IsMKLDNNData()) {
     data = data.Reorder2Default();
-  auto data_mem = data.GetMKLDNNData();
-  mkldnn_output_t out_mem;
-  if (req[fullc::kOut] == kWriteTo) {
-    // update out mem ptr to cached_output_
-    MSHADOW_TYPE_SWITCH(output.dtype(), DType, {
-      cached_out_mem_->set_data_handle(reinterpret_cast<void *>(output.data().dptr<DType>()));
-    });
-    fwd_->SetNewMem(*data_mem, *cached_out_mem_);
-  } else {
-    out_mem = CreateMKLDNNMem(output, fwd_->fwd_pd.dst_primitive_desc(),
-                              req[fullc::kOut], &data);
-    if (req[fullc::kOut] != kWriteTo) {
-      fwd_->SetNewMem(*data_mem, *out_mem.second);
-    }
   }
 
+  MSHADOW_TYPE_SWITCH(data.dtype(), DType, {
+    cached_data_mem_->set_data_handle(reinterpret_cast<void *>(data.data().dptr<DType>()));
+  });
+
+  MSHADOW_TYPE_SWITCH(output.dtype(), DType, {
+    cached_out_mem_->set_data_handle(reinterpret_cast<void *>(output.data().dptr<DType>()));
+  });
+  fwd_->SetNewMem(*cached_data_mem_, *cached_out_mem_);
   MKLDNNStream::Get()->RegisterPrim(fwd_->GetFwd());
-  if (req[fullc::kOut] != kWriteTo) {
-    CommitOutput(output, out_mem);
-  }
   MKLDNNStream::Get()->Submit();
 
   if (mkldnn_param.quantized && !mkldnn_param.enable_float_output) {
