@@ -78,6 +78,8 @@ void SgMKLDNNQuantizeOperator::Forward(const OpContext &ctx, const std::vector<N
   float data_min = mshadow::red::limits::MaxValue<float>();
   float data_max = mshadow::red::limits::MinValue<float>();
 
+  CHECK_EQ(req[0], kWriteTo);
+
   aligned_float aligned_data_min, aligned_data_max;
   aligned_data_min.item = data_min;
   aligned_data_max.item = data_max;
@@ -175,11 +177,15 @@ void SgMKLDNNQuantizeOperator::Forward(const OpContext &ctx, const std::vector<N
       fwd_pd_ = std::make_shared<mkldnn::reorder>(reorder_pd, *i_mem_, *o_mem_);
       initalized_ = true;
     }
-    auto o_mem = CreateMKLDNNMem(outputs[0], o_mem_->get_primitive_desc(), req[0]);
+    // auto o_mem = CreateMKLDNNMem(outputs[0], o_mem_->get_primitive_desc(), req[0]);
     i_mem_->set_data_handle(i_mem->get_data_handle());
-    o_mem_->set_data_handle(o_mem.second->get_data_handle());
+    // o_mem_->set_data_handle(o_mem.second->get_data_handle());
+    MSHADOW_TYPE_SWITCH(outputs[0].dtype(), DType, {
+      o_mem_->set_data_handle(reinterpret_cast<void *>(outputs[0].data().dptr<DType>()));
+    });
+
     MKLDNNStream::Get()->RegisterPrim(*fwd_pd_);
-    CommitOutput(outputs[0], o_mem);
+    // CommitOutput(outputs[0], o_mem);
     MKLDNNStream::Get()->Submit();
   }
 }
