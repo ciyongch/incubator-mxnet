@@ -91,15 +91,28 @@ class SliceChannelOp : public Operator {
     for (int i = real_axis + 1; i < in_data[slice_enum::kData].ndim(); ++i) {
       trailing *= in_data[slice_enum::kData].shape_[i];
     }
-    Shape<3> dshape = Shape3(leading, mid, trailing);
-    Shape<3> slice_shape = Shape3(leading, mid / size_, trailing);
-    Tensor<xpu, 3, DType> data = in_data[slice_enum::kData].get_with_shape<xpu, 3, DType>(
-        dshape, s);
-    std::vector<Tensor<xpu, 3, DType> > outputs(size_);
-    for (int i = 0; i < size_; ++i) {
-      outputs[i] = out_data[i].get_with_shape<xpu, 3, DType>(slice_shape, s);
+
+    if (real_axis == 0 && req[0] == kWriteTo) {
+#pragma omp parallel for
+       for (int i = 0; i < size_; i++) {
+         char* in_ptr = reinterpret_cast<char*>(in_data[slice_enum::kData].dptr<DType>());
+         char* out_ptr = reinterpret_cast<char*>(out_data[i].dptr<DType>());
+         size_t stride = trailing * sizeof (DType);
+         size_t offset = i * stride;
+         std::memcpy(out_ptr, in_ptr + offset, stride);
+       }
+    } else {
+      Shape<3> dshape = Shape3(leading, mid, trailing);
+      Shape<3> slice_shape = Shape3(leading, mid / size_, trailing);
+      Tensor<xpu, 3, DType> data = in_data[slice_enum::kData].get_with_shape<xpu, 3, DType>(
+          dshape, s);
+      std::vector<Tensor<xpu, 3, DType> > outputs(size_);
+      for (int i = 0; i < size_; ++i) {
+        outputs[i] = out_data[i].get_with_shape<xpu, 3, DType>(slice_shape, s);
+      }
+
+      Split(data, &outputs, 1, req);
     }
-    Split(data, &outputs, 1, req);
   }
 
   virtual void Backward(const OpContext &ctx,
