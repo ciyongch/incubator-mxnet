@@ -423,23 +423,14 @@ inline int get_num_threads<cpu>(const int N) {
  * \tparam OType output type
  * \tparam VType value type
  */
-#define KERNEL_ASSIGN(out, req, val)  \
-  {                                   \
-    switch (req) {                    \
-      case kNullOp:                   \
-        break;                        \
-      case kWriteTo:                  \
-      case kWriteInplace:             \
-        (out) = (val);                \
-        break;                        \
-      case kAddTo:                    \
-        (out) += (val);               \
-        break;                        \
-      default:                        \
-        break;                        \
-    }                                 \
-  }
-
+#define KERNEL_ASSIGN(out, req, val)               \
+  {                                                \
+    if (req == kWriteTo || req == kWriteInplace) { \
+      (out) = (val);                               \
+    } else if (req == kAddTo) {                    \
+      (out) += (val);                              \
+    }                                              \
+  }                                                \
 
 #define MXNET_ADD_ALL_TYPES \
   .add_enum("float32", mshadow::kFloat32) \

@@ -172,11 +172,12 @@ MSHADOW_XINLINE static void LayerNormLastDim(index_t m,
     DType mean_ = x_sum / n;
     DType var_ = math::sqrt(x_square_sum / n - mean_ * mean_ + eps);
 
+    DType reciprocal = 1.0f / var_;
 #if !defined(_MSC_VER)
 #pragma omp simd
 #endif
     for (index_t j = 0; j < n; j++) {
-      out_offset[j] = (in_offset[j] - mean_) * gamma[j] / var_ + beta[j];
+      out_offset[j] = (in_offset[j] - mean_) * gamma[j] * reciprocal + beta[j];
     }
 
     aligned_mean[i].item = mean_;
