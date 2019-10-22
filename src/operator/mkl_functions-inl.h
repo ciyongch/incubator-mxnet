@@ -162,9 +162,7 @@ MSHADOW_XINLINE static void LayerNormLastDim(index_t m,
     DType x_sum = 0.0f;
     DType x_square_sum = 0.0f;
 
-#if !defined(_MSC_VER)
 #pragma omp simd
-#endif
     for (index_t j = 0; j < n; j++) {
       x_sum += in_offset[j];
       x_square_sum += in_offset[j] * in_offset[j];
@@ -173,9 +171,7 @@ MSHADOW_XINLINE static void LayerNormLastDim(index_t m,
     DType var_ = math::sqrt(x_square_sum / n - mean_ * mean_ + eps);
 
     DType reciprocal = 1.0f / var_;
-#if !defined(_MSC_VER)
 #pragma omp simd
-#endif
     for (index_t j = 0; j < n; j++) {
       out_offset[j] = (in_offset[j] - mean_) * gamma[j] * reciprocal + beta[j];
     }

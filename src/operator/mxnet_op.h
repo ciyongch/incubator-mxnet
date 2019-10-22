@@ -661,7 +661,7 @@ struct Kernel<OP, cpu> {
   inline static bool Launch(mshadow::Stream<cpu> *, const size_t N, Args... args) {
 #ifdef _OPENMP
     const int omp_threads = engine::OpenMP::Get()->GetRecommendedOMPThreadCount();
-    if (omp_threads < 2) {
+    if (omp_threads < 2 || N == 1) {
       for (size_t i = 0; i < N; ++i) {
         OP::Map(i, args...);
       }
