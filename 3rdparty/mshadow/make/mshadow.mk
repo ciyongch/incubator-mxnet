@@ -26,7 +26,7 @@ ifndef USE_SSE
 endif
 
 ifeq ($(USE_SSE), 1)
-	MSHADOW_CFLAGS += -msse3
+	MSHADOW_CFLAGS += -march=native
 else
 	MSHADOW_CFLAGS += -DMSHADOW_USE_SSE=0
 endif
@@ -55,11 +55,13 @@ ifndef USE_F16C
     # then you can set USE_F16C=1 explicitly to leverage that capability"
 endif
 
-ifeq ($(USE_F16C), 1)
-        MSHADOW_CFLAGS += -mf16c
-else
-        MSHADOW_CFLAGS += -DMSHADOW_USE_F16C=0
-endif
+# ifeq ($(USE_F16C), 1)
+#         MSHADOW_CFLAGS += -mf16c
+# else
+#         MSHADOW_CFLAGS += -DMSHADOW_USE_F16C=0
+# endif
+
+MSHADOW_CFLAGS += -DMSHADOW_USE_F16C=0
 
 ifeq ($(USE_CUDA), 0)
 	MSHADOW_CFLAGS += -DMSHADOW_USE_CUDA=0
