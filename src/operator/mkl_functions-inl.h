@@ -159,21 +159,49 @@ MSHADOW_XINLINE static void LayerNormLastDim(index_t m,
   for (index_t i = 0; i < m; i++) {
     DType* in_offset = a + i * n;
     DType* out_offset = b + i * n;
+    DType sum_temp[16] = {0.0f};
+    DType sqr_temp[16] = {0.0f};
+
+    const index_t loop = n / 16;
+    for (index_t l = 0; l < loop; l++) {
+#pragma omp simd
+      for (index_t j = 0; j < 16; j++) {
+        sum_temp[j] += in_offset[j + l * 16];
+        sqr_temp[j] += in_offset[j + l * 16] * in_offset[j + l * 16];
+      }
+    }
+
+    // tail
+    if (loop * 16 < n) {
+      for (index_t j = loop * 16; j < n; j++) {
+        sum_temp[15] += in_offset[j];
+        sqr_temp[15] += in_offset[j] * in_offset[j];
+      }
+    }
+
     DType x_sum = 0.0f;
     DType x_square_sum = 0.0f;
-
-#pragma omp simd
-    for (index_t j = 0; j < n; j++) {
-      x_sum += in_offset[j];
-      x_square_sum += in_offset[j] * in_offset[j];
+    for (index_t j = 0; j < 16; j++) {
+      x_sum += sum_temp[j];
+      x_square_sum += sqr_temp[j];
     }
+
     DType mean_ = x_sum / n;
     DType var_ = math::sqrt(x_square_sum / n - mean_ * mean_ + eps);
 
     DType reciprocal = 1.0f / var_;
-#pragma omp simd
-    for (index_t j = 0; j < n; j++) {
-      out_offset[j] = (in_offset[j] - mean_) * gamma[j] * reciprocal + beta[j];
+    for (index_t l = 0; l < loop; l++) {
+#pragma omp smid
+      for (index_t j = 0; j < 16; j++) {
+        out_offset[j + l * 16] = (in_offset[j + l * 16] - mean_) * gamma[j + l * 16] * reciprocal + beta[j + l * 16];
+      }
+    }
+
+    // tail
+    if (loop * 16 < n) {
+      for (index_t j = loop * 16; j < n; j++) {
+        out_offset[j] = (in_offset[j] - mean_) * gamma[j] * reciprocal + beta[j];
+      }
     }
 
     aligned_mean[i].item = mean_;
