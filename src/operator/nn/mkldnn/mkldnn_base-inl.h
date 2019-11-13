@@ -468,6 +468,8 @@ mkldnn_memory_format_t GetDefaultFormat(const mkldnn::memory::desc &desc);
 mkldnn_memory_format_t GetDefaultFormat(int num_dims);
 mkldnn::memory::primitive_desc GetPrimitiveDesc(mkldnn::memory::primitive_desc pd,
                                                 mkldnn_memory_format_t format);
+mkldnn::memory::primitive_desc GetPrimitiveDesc(mkldnn::memory::primitive_desc pd,
+                                                int dtype);
 
 inline bool same_shape(const mxnet::TShape &shape, const mkldnn_dims_t dims, int ndims) {
   if (shape.ndim() != ndims)

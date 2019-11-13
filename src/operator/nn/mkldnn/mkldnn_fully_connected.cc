@@ -56,15 +56,8 @@ mkldnn::inner_product_forward::primitive_desc GetFCFwdImpl(
     if ((full_param.mkldnn_param.min_calib_range.has_value() &&
          full_param.mkldnn_param.max_calib_range.has_value()) ||
         full_param.mkldnn_param.enable_float_output) {
-      if (full_param.requantize_scales.size()) {
-        int mask = full_param.requantize_scales.size() > 1 ? 2 : 0;
-        attr.set_output_scales(mask, full_param.requantize_scales);
-      } else if (full_param.output_scales.size()) {
-        int mask = full_param.output_scales.size() > 1 ? 2 : 0;
-        attr.set_output_scales(mask, full_param.output_scales);
-      } else {
-        LOG(FATAL) << "Must specified either output_scales or requantize_scales!";
-      }
+      int mask = (full_param.output_scales.size() == 1) ? 0 : 1 << 1;
+      attr.set_output_scales(mask, full_param.output_scales);
       attr.set_int_output_round_mode(round_nearest);
     }
   }

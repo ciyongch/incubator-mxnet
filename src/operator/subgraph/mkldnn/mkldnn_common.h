@@ -1,0 +1,168 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+/*!
+ * Copyright (c) 2019 by Contributors
+ * \file mkldnn_common.h
+ * \brief Common header file for MKLDNN backend subgraph
+ * \author Ciyong Chen
+*/
+
+#ifndef MXNET_OPERATOR_SUBGRAPH_MKLDNN_MKLDNN_COMMON_H
+#define MXNET_OPERATOR_SUBGRAPH_MKLDNN_MKLDNN_COMMON_H
+#if MXNET_USE_MKLDNN == 1
+
+namespace mxnet {
+namespace op {
+
+template <typename DType>
+static std::vector<float> GetWeightScales(const NDArray &weight,
+                                          bool support_channelwise_scale) {
+  using mshadow::red::limits::MaxValue;
+  using mshadow::red::limits::MinValue;
+  std::vector<float> weight_scales;
+  const DType *weight_ptr = weight.data().dptr<DType>();
+  mxnet::TShape wshape = weight.shape();
+  size_t channel = wshape[0];
+
+  // TODO(Zhennan): Handle the case weight is not in dims 4.
+  size_t offset = wshape.ProdShape(1, wshape.ndim());
+  std::vector<DType> weight_c_min(channel, MaxValue<DType>());
+  std::vector<DType> weight_c_max(channel, MinValue<DType>());
+  for (int c = 0; c < static_cast<int>(channel); ++c) {
+    const DType *p1 = weight_ptr + c * offset;
+    for (size_t k = 0; k < offset; ++k) {
+      if (weight_c_min[c] > p1[k])
+        weight_c_min[c] = p1[k];
+      if (weight_c_max[c] < p1[k])
+        weight_c_max[c] = p1[k];
+    }
+  }
+
+  if (support_channelwise_scale) {
+    weight_scales.resize(channel);
+    for (int c = 0; c < static_cast<int>(channel); ++c) {
+      DType weight_range = MaxAbs(weight_c_min[c], weight_c_max[c]);
+      weight_scales[c] = kInt8Range / weight_range;
+    }
+  } else {
+    DType total_min = weight_c_min[0];
+    DType total_max = weight_c_max[0];
+    for (size_t c = 0; c < channel; ++c) {
+      if (total_min > weight_c_min[c]) total_min = weight_c_min[c];
+      if (total_max < weight_c_max[c]) total_max = weight_c_max[c];
+    }
+    weight_scales.resize(1);
+    DType weight_range = MaxAbs(total_min, total_max);
+    weight_scales[0] = kInt8Range / weight_range;
+  }
+  return weight_scales;
+}
+
+template <typename DType>
+inline void GetMinMaxFromNDArray(const NDArray data, DType *min, DType *max) {
+  NDArray default_data = data.Reorder2Default();
+  auto data_ptr = default_data.data().dptr<DType>();
+  auto nthreads = engine::OpenMP::Get()->GetRecommendedOMPThreadCount();
+
+  DType data_min = mshadow::red::limits::MaxValue<DType>();
+  DType data_max = mshadow::red::limits::MinValue<DType>();
+  std::vector<DType> data_mins(nthreads, data_min);
+  std::vector<DType> data_maxs(nthreads, data_max);
+  #pragma omp parallel for num_threads(nthreads)
+  for (index_t i = 0; i < static_cast<index_t>(data.shape().Size()); ++i) {
+    int tid = omp_get_thread_num();
+    if (data_ptr[i] > data_maxs[tid]) data_maxs[tid] = data_ptr[i];
+    if (data_ptr[i] < data_mins[tid]) data_mins[tid] = data_ptr[i];
+  }
+  for (index_t i = 0; i < static_cast<index_t>(nthreads); ++i) {
+    if (data_maxs[i] > data_max) data_max = data_maxs[i];
+    if (data_mins[i] < data_min) data_min = data_mins[i];
+  }
+  *min = data_min;
+  *max = data_max;
+}
+
+static void ConvertWeightBias2MKLDNN(NDArray *weight, NDArray *bias, bool has_bias,
+                                     const mkldnn::memory::primitive_desc weight_pd,
+                                     const mkldnn::memory::primitive_desc *bias_pd,
+                                     const int num_groups, float data_scale,
+                                     const std::vector<float> &weight_scales,
+                                     const bool submit=true) {
+  MKLDNNStream *stream = MKLDNNStream::Get();
+  const auto new_weight = NDArray(weight_pd);
+  const auto new_weights_memory = new_weight.GetMKLDNNData();
+  primitive_attr weight_attr;
+  if (weight_scales.size()) {
+    const int weight_mask = (weight_scales.size()) == 1 ? 0 : 1;
+    weight_attr.set_int_output_round_mode(round_mode::round_nearest);
+    weight_attr.set_output_scales(weight_mask, weight_scales);
+  }
+  auto default_weights_memory = GetWeights(*weight, num_groups);
+  if (default_weights_memory == nullptr) default_weights_memory = weight->GetMKLDNNData();
+  const auto weight_reorder_pd =
+      mkldnn::reorder::primitive_desc(default_weights_memory->get_primitive_desc(),
+                                      new_weights_memory->get_primitive_desc(), weight_attr);
+  stream->RegisterPrim(
+      mkldnn::reorder(weight_reorder_pd, *default_weights_memory, *new_weights_memory));
+
+  NDArray new_bias;
+  if (has_bias && data_scale) {
+    std::vector<float> bias_scales(weight_scales.size());
+    for (size_t c = 0; c < weight_scales.size(); ++c) {
+      bias_scales[c] = weight_scales[c] * data_scale;
+    }
+    new_bias = NDArray(*bias_pd);
+    const auto new_bias_memory = new_bias.GetMKLDNNData();
+    const int bias_mask = (bias_scales.size()) == 1 ? 0 : 1;
+    primitive_attr bias_attr;
+    bias_attr.set_int_output_round_mode(round_mode::round_nearest);
+    bias_attr.set_output_scales(bias_mask, bias_scales);
+    auto bias_weights_memory = bias->GetMKLDNNData();
+    auto bias_reorder_pd =
+        mkldnn::reorder::primitive_desc(bias_weights_memory->get_primitive_desc(),
+                                        new_bias_memory->get_primitive_desc(), bias_attr);
+    stream->RegisterPrim(
+        mkldnn::reorder(bias_reorder_pd, *bias_weights_memory, *new_bias_memory));
+  }
+  if (submit)
+    stream->Submit();
+  *weight = new_weight;
+  if (has_bias && data_scale) *bias = new_bias;
+}
+
+static void QuantizeWeightBias(NDArray *weight, NDArray *bias, bool has_bias, int num_groups,
+                               float data_scale, const std::vector<float> &weight_scales) {
+  const auto weights_mem = GetWeights(*weight, num_groups);
+  const auto new_weight_pd = GetPrimitiveDesc(weights_mem->get_primitive_desc(), mshadow::kInt8);
+  mkldnn::memory::primitive_desc new_bias_pd;
+  if (has_bias) {
+    const auto bias_mem = bias->GetMKLDNNData();
+    new_bias_pd = GetPrimitiveDesc(bias_mem->get_primitive_desc(), mshadow::kInt32);
+  }
+
+  ConvertWeightBias2MKLDNN(weight, bias, has_bias, new_weight_pd, &new_bias_pd, num_groups,
+                           data_scale, weight_scales, false);
+}
+
+}  // namespace op
+}  // namespace mxnet
+
+#endif  // if MXNET_USE_MKLDNN == 1
+#endif  // MXNET_OPERATOR_SUBGRAPH_MKLDNN_MKLDNN_COMMON_H
