@@ -37,7 +37,7 @@ mkldnn::inner_product_forward::primitive_desc GetFCFwdImpl(
     const NDArray &data, const NDArray &weight, const NDArray *bias,
     const mkldnn::memory::desc &out_md) {
   auto data_md = GetMemDesc(data);
-  auto weight_md = GetMemDesc(weight);
+  auto weight_md = GetWeightDesc(weight, 1, full_param.mkldnn_param.quantized);
   auto engine = CpuEngine::Get()->get_engine();
   auto propagation =
     is_train ? mkldnn::prop_kind::forward_training : mkldnn::prop_kind::forward_scoring;
@@ -57,6 +57,8 @@ mkldnn::inner_product_forward::primitive_desc GetFCFwdImpl(
          full_param.mkldnn_param.max_calib_range.has_value()) ||
         full_param.mkldnn_param.enable_float_output) {
       int mask = (full_param.output_scales.size() == 1) ? 0 : 1 << 1;
+      if (full_param.output_scales.size() == 1)
+        printf("@output_scales: %f\n", full_param.output_scales[0]);
       attr.set_output_scales(mask, full_param.output_scales);
       attr.set_int_output_round_mode(round_nearest);
     }
@@ -78,7 +80,7 @@ mkldnn::inner_product_forward::primitive_desc GetFCFwdImpl(
   };
 
   if (bias) {
-    auto bias_md = GetMemDesc(*bias);
+    auto bias_md = full_param.mkldnn_param.quantized ? GetMemDesc(*bias, mshadow::kInt32) : GetMemDesc(*bias);
     mkldnn::inner_product_forward::desc desc(propagation,
         data_md, weight_md, bias_md, out_md);
     return GetFCFwdPd(desc);

@@ -75,6 +75,7 @@ class SgMKLDNNFCOp {
   size_t weight_ver_;
   size_t bias_ver_;
   std::vector<float> weight_scales_; //channel-wise
+  float data_scale_;
 };
 
 void MKLDNNFCFlattenData(const FullyConnectedParam &param,
@@ -140,15 +141,16 @@ void SgMKLDNNFCOp::Forward(const OpContext &ctx,
         }
   }
 
-  // TODO, check cached_weight_ and cached_bias_
   if (!initialized_) {
     cached_min_data_ = min_data;
     cached_max_data_ = max_data;
     std::vector<float> bias_int32_rescale = {0.0};
     cached_weight_ = weight;
+    weight_ver_ = weight.version();
     NDArray bias;
     if (has_bias) {
       cached_bias_ = in_data[fullc::kBias];
+      bias_ver_ = in_data[fullc::kBias].version();
     } else {
       cached_bias_ = NDArray();
     }
@@ -173,12 +175,12 @@ void SgMKLDNNFCOp::Forward(const OpContext &ctx,
       static_cast<mkldnn::memory::format>(GetDefaultFormat(2)));
     mkldnn::memory::primitive_desc out_mem_pd {out_md, CpuEngine::Get()->get_engine()};
     cached_out_mem_ = std::make_shared<mkldnn::memory>(out_mem_pd, nullptr);
-    float data_scale = 1.0;
 
+    data_scale_ = 0.0f;
     if (mkldnn_param.quantized) {
       CHECK(data.dtype() == mshadow::kInt8 || data.dtype() == mshadow::kUint8);
       auto data_range = (data.dtype() == mshadow::kInt8) ? kInt8Range : kUint8Range;
-      data_scale = data_range / MaxAbs(cached_min_data_, cached_max_data_);
+      data_scale_ = data_range / MaxAbs(cached_min_data_, cached_max_data_);
       float quantized_out_range = mkldnn_param.with_relu ? kUint8Range : kInt8Range;
 
       bool fuse_requantize = false;
@@ -198,15 +200,13 @@ void SgMKLDNNFCOp::Forward(const OpContext &ctx,
       });
       size_t num_channel = cached_weight_.shape()[0];
 
-      QuantizeWeightBias(&cached_weight_, &cached_bias_, has_bias, 1, data_scale, weight_scales_);
-
       if (fuse_requantize || mkldnn_param.enable_float_output) {
         float tmp_scale_ = 1.0;
         if (fuse_requantize) {
           tmp_scale_ = quantized_out_range /
-            MaxAbs(cached_min_output_, cached_max_output_) / data_scale;
+            MaxAbs(cached_min_output_, cached_max_output_) / data_scale_;
         } else {
-          tmp_scale_ = 1.0 / data_scale;
+          tmp_scale_ = 1.0 / data_scale_;
         }
 
         if (support_channelwise_scale) {
@@ -233,17 +233,15 @@ void SgMKLDNNFCOp::Forward(const OpContext &ctx,
     fwd_.reset(new MKLDNNFullyConnectedForward(full_param_, ctx.is_train, data, cached_weight_,
       (has_bias ? &cached_bias_ : nullptr), out_md));
 
-    if (!mkldnn_param.quantized) {
-      mkldnn::memory::primitive_desc bias_md;
-      if (has_bias) {
-        bias_md = fwd_->fwd_pd.bias_primitive_desc();
-        auto bias_desc = bias_md.desc();
-      }
-      ConvertWeightBias2MKLDNN(&cached_weight_, &cached_bias_, has_bias,
-                               fwd_->fwd_pd.weights_primitive_desc(),
-                               has_bias ? &bias_md : nullptr,
-                               1, 0.0, weight_scales_, false);
+    mkldnn::memory::primitive_desc bias_md;
+    if (has_bias) {
+      bias_md = fwd_->fwd_pd.bias_primitive_desc();
+      auto bias_desc = bias_md.desc();
     }
+    ConvertWeightBias2MKLDNN(&cached_weight_, &cached_bias_, has_bias,
+                             fwd_->fwd_pd.weights_primitive_desc(),
+                             has_bias ? &bias_md : nullptr,
+                             1, data_scale_, weight_scales_, false);
 
     if (data.IsMKLDNNData())
       data = data.Reorder2Default();

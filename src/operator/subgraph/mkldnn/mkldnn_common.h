@@ -158,7 +158,7 @@ static void QuantizeWeightBias(NDArray *weight, NDArray *bias, bool has_bias, in
   }
 
   ConvertWeightBias2MKLDNN(weight, bias, has_bias, new_weight_pd, &new_bias_pd, num_groups,
-                           data_scale, weight_scales, false);
+                           data_scale, weight_scales, true);
 }
 
 }  // namespace op
