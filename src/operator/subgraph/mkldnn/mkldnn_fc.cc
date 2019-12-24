@@ -65,8 +65,10 @@ class SgMKLDNNFCOp {
   bool initialized_;
   nnvm::Symbol subgraph_sym_;
   MKLDNNFCFullParam full_param_;
+  mkldnn_args_map_t args_;
   std::shared_ptr<MKLDNNFullyConnectedForward> fwd_;
-  std::shared_ptr<NDArray> cached_weight_;
+  std::shared_ptr<mkldnn::memory> cached_out_mem_;
+  NDArray cached_weight_;
   NDArray cached_bias_;
   float cached_min_data_;
   float cached_max_data_;
@@ -77,6 +79,26 @@ class SgMKLDNNFCOp {
   float cached_min_output_;
   float cached_max_output_;
 };
+
+static inline void MKLDNNFCFlattenData(const FullyConnectedParam &param,
+                                       NDArray *in_data) {
+  const mxnet::TShape ishape = in_data->shape();
+
+  // If the input data is a view of an MKLDNN array, we should create a new
+  // NDArray with reordered data.
+  if (in_data->IsMKLDNNData() && in_data->IsView())
+    *in_data = in_data->Reorder2Default();
+
+  auto data_ndim = ishape.ndim();
+  if (data_ndim != 2) {
+    if (!param.flatten) {
+      *in_data = in_data->MKLDNNDataReshape(
+          Shape2(ishape.ProdShape(0, data_ndim - 1), ishape[data_ndim - 1]));
+    } else {
+      *in_data = in_data->MKLDNNDataReshape(Shape2(ishape[0], ishape.ProdShape(1, data_ndim)));
+    }
+  }
+}
 
 void SgMKLDNNFCOp::Forward(const OpContext &ctx,
                            const std::vector<NDArray> &in_data,
@@ -115,21 +137,20 @@ void SgMKLDNNFCOp::Forward(const OpContext &ctx,
   CHECK_EQ(out_data.size(), total_num_outputs);
 
   NDArray data = in_data[fullc::kData];
-  NDArray weight = cached_weight_ ? *cached_weight_ : in_data[fullc::kWeight];
   NDArray output = out_data[fullc::kOut];
 
-  mkldnn::memory::desc out_md = GetMemDesc(output);
-  MKLDNNFCFlattenData(default_param, out_data[fullc::kOut], &data, &out_md);
+  MKLDNNFCFlattenData(default_param, &data);
 
   if (initialized_ && mkldnn_param.quantized) {
     if (cached_min_data_ != min_data || cached_max_data_ != max_data ||
         cached_min_weight_ != min_weight || cached_max_weight_ != max_weight ||
         (has_bias && (cached_min_bias_ != min_bias || cached_max_bias_ != max_bias))) {
-          initialized_ = false;
-        }
+      initialized_ = false;
+    }
   }
 
   if (!initialized_) {
+    NDArray weight = in_data[fullc::kWeight];
     cached_min_data_ = min_data;
     cached_max_data_ = max_data;
     cached_min_weight_ = min_weight;
@@ -141,6 +162,26 @@ void SgMKLDNNFCOp::Forward(const OpContext &ctx,
     } else {
       cached_bias_ = NDArray();
     }
+
+    // create cached out_md
+    const mxnet::TShape ishape = data.shape();
+    const mxnet::TShape oshape = output.shape();
+    mkldnn::memory::dims out_dims (2);
+    if (oshape.ndim() == 2) {
+      out_dims[0] = static_cast<int>(oshape[0]);
+      out_dims[1] = static_cast<int>(oshape[1]);
+    } else {
+      if (!default_param.flatten) {
+        out_dims[0] = static_cast<int>(oshape.ProdShape(0, oshape.ndim()-1));
+        out_dims[1] = static_cast<int>(oshape[oshape.ndim()-1]);
+      } else {
+        out_dims[0] = static_cast<int>(static_cast<int>(oshape[0]));
+        out_dims[1] = static_cast<int>(oshape.ProdShape(1, oshape.ndim()));
+      }
+    }
+    mkldnn::memory::desc out_md = mkldnn::memory::desc(out_dims, get_mkldnn_type(output.dtype()),
+      static_cast<mkldnn::memory::format_tag>(GetDefaultFormat(2)));   //TODO(ciyong), any or ab?
+    cached_out_mem_ = std::make_shared<mkldnn::memory>(out_md, CpuEngine::Get()->get_engine());
 
     if (mkldnn_param.quantized) {
       CHECK(data.dtype() == mshadow::kInt8 || data.dtype() == mshadow::kUint8);
@@ -158,17 +199,13 @@ void SgMKLDNNFCOp::Forward(const OpContext &ctx,
           // avoid overflow on bias
           bias_int32_rescale = bias_max_rescale;
           float weight_rescale = bias_int32_rescale * bias_scale / data_scale / weight_scale;
-          cached_weight_.reset(new NDArray(weight.storage_type(), weight.shape(), weight.ctx(),
-                                           true, mshadow::kInt8));
           int8_t *weight_ptr = weight.data().dptr<int8_t>();
-          int8_t *quantized_weight_ptr = cached_weight_->data().dptr<int8_t>();
           size_t weight_size = weight.shape().Size();
-#pragma omp parallel for num_threads(engine::OpenMP::Get()->GetRecommendedOMPThreadCount())
+          #pragma omp parallel for num_threads(engine::OpenMP::Get()->GetRecommendedOMPThreadCount())
           for (index_t i = 0; i < static_cast<index_t>(weight_size); ++i) {
-            quantized_weight_ptr[i] = std::round(weight_ptr[i] * weight_rescale);
+            weight_ptr[i] = std::round(weight_ptr[i] * weight_rescale);
           }
           weight_scale *= weight_rescale;
-          weight = *cached_weight_;
         }
         cached_bias_ =
             NDArray(bias.storage_type(), bias.shape(), bias.ctx(), true, mshadow::kInt32);
@@ -209,16 +246,33 @@ void SgMKLDNNFCOp::Forward(const OpContext &ctx,
 
     fwd_.reset(new MKLDNNFullyConnectedForward(full_param_, ctx.is_train, data, weight,
       (has_bias ? &cached_bias_ : nullptr), out_md));
+
+    // convert weight and bias to the format that MKL-DNN requires
+    cached_weight_ = NDArray(fwd_->fwd_pd.weights_desc());
+    auto cached_weight_mem = cached_weight_.GetMKLDNNData();
+    auto def_weight_mem = weight.GetMKLDNNData();
+    std::unordered_map<int, mkldnn::memory> args(
+      {{MKLDNN_ARG_FROM, *def_weight_mem},
+       {MKLDNN_ARG_TO, *cached_weight_mem}});
+    MKLDNNStream::Get()->RegisterPrimArgs(
+      mkldnn::reorder(*def_weight_mem, *cached_weight_mem), args);
+
+    args_[MKLDNN_ARG_SRC] = *data.GetMKLDNNData();
+    args_[MKLDNN_ARG_WEIGHTS] = *cached_weight_mem;
+    if (has_bias)
+      args_[MKLDNN_ARG_BIAS] = *cached_bias_.GetMKLDNNData();
+    args_[MKLDNN_ARG_DST] = *cached_out_mem_;
     initialized_ = true;
   }
-  std::vector<NDArray> new_inputs;
-  if (has_bias) {
-    new_inputs = {data, weight, cached_bias_};
-  } else {
-    new_inputs = {data, weight};
-  }
 
-  MKLDNNFCForwardFullFeature(full_param_, ctx, fwd_.get(), new_inputs, req, out_data);
+  auto data_mem = data.GetMKLDNNDataReorder(fwd_->fwd_pd.src_desc());
+  MSHADOW_TYPE_SWITCH(output.dtype(), DType, {
+    cached_out_mem_->set_data_handle(reinterpret_cast<void *>(output.data().dptr<DType>()));
+  });
+  args_[MKLDNN_ARG_SRC] = *data_mem;
+  args_[MKLDNN_ARG_DST] = *cached_out_mem_;
+  MKLDNNStream::Get()->RegisterPrimArgs(fwd_->GetFwd(), args_);
+  MKLDNNStream::Get()->Submit();
 
   if (mkldnn_param.quantized && !mkldnn_param.enable_float_output) {
     float *min_output_ptr = out_data[quantized_fullc::kOutMin].data().dptr<float>();
