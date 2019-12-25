@@ -135,11 +135,9 @@ NNVM_REGISTER_OP(BatchNorm)
     }
     return node;
   })
-.set_attr<FAvoidQuantizeInput>("FAvoidQuantizeInput", [](const NodeAttrs &attrs, size_t index) {
-  if (index == 0)
-    return false;
-  else
-    return true;
+.set_attr<FAvoidQuantizeInput>("FAvoidQuantizeInput", [](
+    const NodeAttrs &attrs, const size_t index, const int quantize_dim) {
+    return (index == 0) ? true : false;
 });
 
 }  // namespace op

@@ -29,7 +29,7 @@ import os
 import shutil
 import numpy as np
 from ..base import _LIB, check_call, py_str
-from ..base import c_array, c_str, mx_uint, c_str_array
+from ..base import c_array, c_str, mx_uint, mx_int, c_str_array
 from ..base import NDArrayHandle, SymbolHandle
 from ..symbol import Symbol
 from ..symbol import load as sym_load
@@ -84,7 +84,8 @@ def _quantize_params(qsym, params, th_dict):
     return quantized_params
 
 def _quantize_symbol(sym, ctx, excluded_symbols=None, excluded_operators=None,
-                     offline_params=None, quantized_dtype='int8', quantize_mode='smart'):
+                     offline_params=None, quantized_dtype='int8', quantize_mode='smart',
+                     fc_weight_quantize_dim=-1):
     """Given a symbol object representing a neural network of data type FP32,
     quantize it into a INT8 network.
 
@@ -108,6 +109,9 @@ def _quantize_symbol(sym, ctx, excluded_symbols=None, excluded_operators=None,
         The quantized destination type for input data.
     quantize_mode: str
         The mode that quantization pass to apply.
+    fc_weight_quantize_dim: int
+        The quantization dimension applied to fc weight. Currently support per tensor and per axis
+        quantization.
 
     """
     num_excluded_symbols = 0
@@ -146,6 +150,7 @@ def _quantize_symbol(sym, ctx, excluded_symbols=None, excluded_operators=None,
                                      c_str(quantized_dtype),
                                      ctypes.c_bool(True),
                                      c_str(quantize_mode),
+                                     mx_int(fc_weight_quantize_dim),
                                      ctypes.byref(size),
                                      ctypes.byref(calib_str)))
     calib_layer = []
@@ -451,7 +456,8 @@ def quantize_model(sym, arg_params, aux_params,
                    data_names=('data',), label_names=('softmax_label',),
                    ctx=cpu(), excluded_sym_names=None, excluded_op_names=None, calib_mode='entropy',
                    calib_data=None, num_calib_examples=None,
-                   quantized_dtype='int8', quantize_mode='smart', logger=logging):
+                   quantized_dtype='int8', quantize_mode='smart',
+                   fc_weight_quantize_dim=-1, logger=logging):
     """User-level API for generating a quantized model from a FP32 model w/ or w/o calibration.
     The backend quantized operators are only enabled for Linux systems. Please do not run
     inference using the quantized models on Windows for now.
@@ -507,6 +513,11 @@ def quantize_model(sym, arg_params, aux_params,
         The mode that quantization pass to apply. Support 'full' and 'smart'.
         'full' means quantize all operator if possible.
         'smart' means quantization pass will smartly choice which operator should be quantized.
+    fc_weight_quantize_dim : int
+        The quantization dimension applied to fc weight. Currently support per tensor and per axis
+        quantization.
+        '-1' means per tensor quantization, otherwise, per axis quantization will be applied to
+        the specified dimension of fc weight.
     logger : Object
         A logging object for printing information during the process of quantization.
 
@@ -536,9 +547,10 @@ def quantize_model(sym, arg_params, aux_params,
                          ' expected `int8`, `uint8` or `auto`' % quantized_dtype)
     qsym, calib_layer = _quantize_symbol(sym, ctx, excluded_symbols=excluded_sym_names,
                                          excluded_operators=excluded_op_names,
-                                         offline_params=list(
-                                             arg_params.keys()),
-                                         quantized_dtype=quantized_dtype, quantize_mode=quantize_mode)
+                                         offline_params=list(arg_params.keys()),
+                                         quantized_dtype=quantized_dtype,
+                                         quantize_mode=quantize_mode,
+                                         fc_weight_quantize_dim=fc_weight_quantize_dim)
     th_dict = {}
     if calib_mode is not None and calib_mode != 'none':
         if not isinstance(ctx, Context):

@@ -925,6 +925,7 @@ int MXQuantizeSymbol(SymbolHandle sym_handle,
                      const char *quantized_dtype,
                      const bool calib_quantize,
                      const char *quantize_mode,
+                     const int fc_weight_quantize_dim,
                      mx_uint* out_num_calib_names,
                      const char ***out_calib_names) {
   nnvm::Symbol *s = new nnvm::Symbol();
@@ -952,6 +953,7 @@ int MXQuantizeSymbol(SymbolHandle sym_handle,
   g.attrs["quantized_dtype"] = std::make_shared<nnvm::any>(std::move(quantized_type));
   g.attrs["target_ctx"] = std::make_shared<nnvm::any>(target_dev);
   g.attrs["quantize_mode"] = std::make_shared<nnvm::any>(std::move(quantized_mode));
+  g.attrs["fc_weight_quantize_dim"] = std::make_shared<nnvm::any>(fc_weight_quantize_dim);
   g = ApplyPass(std::move(g), "QuantizeGraph");
   const auto& calib_nodes = g.GetAttr<std::vector<std::string>>("calib_nodes");
   MXAPIThreadLocalEntry<> *ret = MXAPIThreadLocalStore<>::Get();

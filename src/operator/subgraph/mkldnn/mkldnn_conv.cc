@@ -751,7 +751,9 @@ nnvm::NodePtr SgMKLDNNConvQuantizedOp(const NodeAttrs& attrs) {
   return node;
 }
 
-bool SgMKLDNNAvoidQuantizeInput(const NodeAttrs &attrs, size_t index) {
+bool SgMKLDNNAvoidQuantizeInput(const NodeAttrs &attrs,
+                                const size_t index,
+                                const int quantize_dim) {
   auto const &param = nnvm::get<MKLDNNConvFusionParam>(attrs.parsed);
   std::unordered_set<size_t> avoid_indice;
   size_t idx = 0;

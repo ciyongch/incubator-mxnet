@@ -181,11 +181,9 @@ NNVM_REGISTER_OP(Embedding)
     }
     return node;
   })
-.set_attr<FAvoidQuantizeInput>("FAvoidQuantizeInput", [](const NodeAttrs &attrs, size_t index) {
-  if (index == 0)
-    return true;
-  else
-    return false;
+.set_attr<FAvoidQuantizeInput>("FAvoidQuantizeInput", [](
+    const NodeAttrs &attrs, const size_t index, const int quantize_dim) {
+    return (index == 0) ? true : false;
 });
 }  // namespace op
 }  // namespace mxnet

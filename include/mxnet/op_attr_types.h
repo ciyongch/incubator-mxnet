@@ -344,7 +344,17 @@ using FNeedRequantize = std::function<bool (const NodeAttrs& attrs)>;
  * which can handle fp32 inputs directly.
  */
 using FAvoidQuantizeInput = std::function<bool (const NodeAttrs& attrs,
-                                                size_t index)>;
+                                                const size_t index,
+                                                const int quantize_dim=-1)>;
+#if 0 //TODO(ciyong)
+/*!
+ * \brief Register a function to determin if the input of quantized FullyConnected
+ * needs to be quantized.
+ */
+using FAvoidQuantizeFCInput = std::function<bool (const NodeAttrs& attrs,
+                                                  const size_t index,
+                                                  const int quantize_dim=-1)>;
+#endif
 
 /*!
  * \brief Register a function to determine if the input of a quantized operator

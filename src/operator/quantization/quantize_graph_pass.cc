@@ -265,6 +265,7 @@ Graph QuantizeGraph(Graph &&src) {
       Op::GetAttr<mxnet::FAvoidQuantizeInput>("FAvoidQuantizeInput");
   const auto offline_params = src.GetAttr<std::unordered_set<std::string>>("offline_params");
   const auto quantized_dtype = src.GetAttr<std::string>("quantized_dtype");
+  const auto quantize_dim = src.GetAttr<int>("fc_weight_quantize_dim");
 
   std::unordered_map<NodePtr, NodePtr> quantized_node_map;
   MarkQuantizedNodes(src, &quantized_node_map);
@@ -295,7 +296,7 @@ Graph QuantizeGraph(Graph &&src) {
         // e's source node and the newly created quantize op so that the quantize op can be
         // reused next time when the same entry is visited again.
         if (avoid_quantize_input_map.count(node->op()) &&
-            avoid_quantize_input_map[node->op()](node->attrs, i)) {
+            avoid_quantize_input_map[node->op()](node->attrs, i, quantize_dim)) {
           new_node->inputs.emplace_back(mirror_entry);
         } else if (!quantized_node_map.count(e.node)) {
           if (mirror_entry_map.count(e)) {
@@ -346,7 +347,7 @@ Graph QuantizeGraph(Graph &&src) {
         uint32_t min_index = 1;
         uint32_t max_index = 2;
         if (avoid_quantize_input_map.count(node->op()) &&
-            avoid_quantize_input_map[node->op()](node->attrs, i)) {
+            avoid_quantize_input_map[node->op()](node->attrs, i, quantize_dim)) {
           // skip non-quantized input
           continue;
         }
@@ -501,6 +502,10 @@ Graph QuantizeGraph(Graph &&src) {
           calib_nodes.push_back(common::GetOutputName({node, static_cast<uint32_t>(idx), 0}));
         }
       }
+    }
+
+    if ((quantize_dim >= 0) && (node->op() == Op::Get("_sg_mkldnn_fully_connected"))) {
+      node->attrs.dict["quantize_dim"] = quantize_dim;
     }
   });
   ret.attrs["calib_nodes"] = std::make_shared<dmlc::any>(std::move(calib_nodes));

@@ -502,6 +502,22 @@ nnvm::NodePtr SgMKLDNNFCQuantizedOp(const NodeAttrs& attrs) {
   return node;
 }
 
+bool SgMKLDNNAvoidQuantizeInput(const NodeAttrs &attrs,
+                                const size_t index,
+                                const int quantize_dim) {
+  auto const &full_param = nnvm::get<MKLDNNFCFullParam>(attrs.parsed);
+  std::unordered_set<size_t> avoid_indexes;
+  // quantize_dim=-1 means doing per tensor quantization to
+  // weight, which will be handled in offline params quantization pass.
+  if (quantize_dim >=0) {
+    avoid_indexes.insert(1);      // weight
+    if (!full_param.default_param.no_bias) {
+      avoid_indexes.insert(2);    // bias
+    }
+  }
+  return avoid_indexes.count(index);
+}
+
 NNVM_REGISTER_OP(_sg_mkldnn_fully_connected)
 .describe(R"code(_sg_mkldnn_fully_connected)code" ADD_FILELINE)
 .set_num_inputs([](const NodeAttrs& attrs) {
@@ -540,6 +556,7 @@ NNVM_REGISTER_OP(_sg_mkldnn_fully_connected)
 })
 .set_attr<FQuantizedOp>("FQuantizedOp", SgMKLDNNFCQuantizedOp)
 .set_attr<FNeedRequantize>("FNeedRequantize", [](const NodeAttrs& attrs) { return true; });
+.set_attr<FAvoidQuantizeInput>("FAvoidQuantizeInput", SgMKLDNNFCAvoidQuantizeInput);
 
 }  // namespace op
 }  // namespace mxnet
