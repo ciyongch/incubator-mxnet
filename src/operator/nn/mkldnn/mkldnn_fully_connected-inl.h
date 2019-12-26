@@ -68,8 +68,7 @@ struct MKLDNNFCFullParam {
   FullyConnectedParam default_param;
   MKLDNNFCParam mkldnn_param;
   MKLDNNPostEltwiseParam eltwise_param;
-  std::vector<float> output_scales = {0.0};
-  std::vector<float> requantize_scales = {0.0};
+  std::vector<float> output_scales = {0.0f};
 };
 
 mkldnn::inner_product_forward::primitive_desc GetFCFwdImpl(
