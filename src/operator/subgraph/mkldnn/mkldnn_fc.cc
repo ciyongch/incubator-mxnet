@@ -320,7 +320,6 @@ void SgMKLDNNFCOp::Forward(const OpContext &ctx,
                               fwd_->fwd_pd.weights_desc(),
                               has_bias ? &bias_md : nullptr,
                               1, data_scale_, weight_scales_, false);
-      std::cout << "convert weight..." << std::endl;
     } else {
       cached_weight_ = NDArray(fwd_->fwd_pd.weights_desc());
       auto cached_weight_mem = cached_weight_.GetMKLDNNData();
@@ -330,7 +329,6 @@ void SgMKLDNNFCOp::Forward(const OpContext &ctx,
         {MKLDNN_ARG_TO, *cached_weight_mem}});
       MKLDNNStream::Get()->RegisterPrimArgs(
         mkldnn::reorder(*def_weight_mem, *cached_weight_mem), args);
-      std::cout << "reorder weight..." << std::endl;
     }
 
     args_[MKLDNN_ARG_SRC] = *data.GetMKLDNNData();
@@ -598,14 +596,10 @@ static bool SgMKLDNNAvoidFCQuantizeInput(const NodeAttrs& attrs, const size_t in
   auto const &full_param = nnvm::get<MKLDNNFCFullParam>(attrs.parsed);
   std::unordered_set<size_t> avoid_indexes;
   if (quantize_granularity == "channel-wise") {
-    std::cout << "@ channel_wise_quantize: " << quantize_granularity << "." << std::endl; //TODO (remove)
     avoid_indexes.insert(fullc::kWeight);   // weight
     if (!full_param.default_param.no_bias) {
       avoid_indexes.insert(fullc::kBias);   // bias
     }
-  }
-  else { //TODO(remove)
-    std::cout << "@ tensor_wise_quantize: " << quantize_granularity << "." << std::endl;
   }
 
   return avoid_indexes.count(index_to_check);
