@@ -59,7 +59,8 @@ static std::vector<float> GetWeightScales(const NDArray &weight, const NDArray *
     #pragma omp parallel for num_threads(nthreads)
     for (int c = 0; c < static_cast<int>(channel); ++c) {
       float scale = GetQuantizeScale(mshadow::kInt8, weight_c_min[c], weight_c_max[c]);
-      if (bias_ptr) {
+      //printf("scale[%d]: %.3f, bias_ptr[%d]: %.3f\n", c, scale, c, bias_ptr[c]);
+      if (bias_ptr && bias_ptr[c]) {
         // avoid overflow on bias
         // TODO(zhennan): mkldnn has bug to handle INT_MAX in bias, so set the maximum value of bias
         // to INT_MAX / 2.
@@ -129,22 +130,6 @@ static void ConvertWeightBias2MKLDNN(NDArray *weight, NDArray *bias, bool has_bi
   *weight = new_weight;
   if (has_bias && data_scale) *bias = new_bias;
 }
-
-#if 0
-static void QuantizeWeightBias(NDArray *weight, NDArray *bias, bool has_bias, int num_groups,
-                               float data_scale, const std::vector<float> &weight_scales) {
-  const auto weights_mem = GetWeights(*weight, num_groups);
-  const auto new_weight_pd = GetPrimitiveDesc(weights_mem->get_desc(), mshadow::kInt8);
-  mkldnn::memory::primitive_desc new_bias_pd;
-  if (has_bias) {
-    const auto bias_mem = bias->GetMKLDNNData();
-    new_bias_pd = GetPrimitiveDesc(bias_mem->get_primitive_desc(), mshadow::kInt32);
-  }
-
-  ConvertWeightBias2MKLDNN(weight, bias, has_bias, new_weight_pd, &new_bias_pd, num_groups,
-                           data_scale, weight_scales, true);
-}
-#endif
 
 }  // namespace op
 }  // namespace mxnet

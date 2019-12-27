@@ -171,6 +171,7 @@ def check_quantize(sym, data_shape, out_type, name='conv',
                                                                    num_calib_examples=1,
                                                                    quantize_mode='full')
   qsym = qsym.get_backend_symbol(QUANTIZE_SG_PASS_NAME)
+  qsym.save('fc.json')  # TODO(ciyong), remove
   if check_calibration:
     check_qsym_calibrated(qsym, out_type, name=name)
   if check_scale_align:
@@ -240,7 +241,7 @@ def check_fusion(sym, data_shape, attrs_dict, check_fp32_fusion=True, check_quan
   if check_fp32_fusion:
     data_min = -1.0
     data_max = 1.0
-    if ''.join(sym.get_internals().list_outputs()).find('sqrt'):
+    if ''.join(sym.get_internals().list_outputs()).find('sqrt') != -1:
       check_quantization = False
       data_min = 0
 
@@ -846,7 +847,6 @@ def test_single_fc():
       check_fusion(syms, dshape, attrs, check_quantization=True)
     else:
       check_fusion(syms, dshape, attrs, check_quantization=False)
-
 
 @with_seed()
 def test_fc_eltwise():
