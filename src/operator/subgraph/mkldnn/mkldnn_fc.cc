@@ -63,6 +63,7 @@ class SgMKLDNNFCOp {
 
  private:
   bool initialized_{false};
+  bool channel_wise_runtime_{false};
   nnvm::Symbol subgraph_sym_;
   MKLDNNFCFullParam full_param_;
   mkldnn_args_map_t args_;
@@ -123,14 +124,13 @@ void SgMKLDNNFCOp::Forward(const OpContext &ctx,
   float min_bias = 0.0f;
   float max_bias = 0.0f;
 
-  bool channel_wise = false;
-  if (mkldnn_param.channel_wise_quantize.has_value() &&
+  if (!initialized_ && mkldnn_param.channel_wise_quantize.has_value() &&
       mkldnn_param.channel_wise_quantize) {
-    channel_wise = true;
+    channel_wise_runtime_ = true;
   }
 
   if (mkldnn_param.quantized) {
-    if (channel_wise) {
+    if (channel_wise_runtime_) {
       total_num_inputs = base_num_inputs + 2;
     } else {
       total_num_inputs = base_num_inputs * 3;
@@ -156,7 +156,7 @@ void SgMKLDNNFCOp::Forward(const OpContext &ctx,
   MKLDNNFCFlattenData(default_param, &data);
 
   if (initialized_ && mkldnn_param.quantized) {
-    if (channel_wise) {
+    if (channel_wise_runtime_) {
       if (cached_min_data_ != min_data || cached_max_data_ != max_data ||
           weight_ver_ != weight.version() ||
           (has_bias && (bias_ver_ != in_data[fullc::kBias].version()))) {
@@ -229,7 +229,7 @@ void SgMKLDNNFCOp::Forward(const OpContext &ctx,
       // True          True                       True
       // True          False                      Error
       // False         True/False                 False
-      if (channel_wise && !support_channelwise_scale) {
+      if (channel_wise_runtime_ && !support_channelwise_scale) {
         LOG(FATAL)
           << "Currently, channel-wise quantization requires fuse requantize or dequantize."
           << " Please make sure the `min_calib_range` and `max_calib_range` are set when only"
@@ -237,7 +237,7 @@ void SgMKLDNNFCOp::Forward(const OpContext &ctx,
           << " or the env var of `MXNET_DISABLE_MKLDNN_QFC_FLOAT_OUTPUT` and "
           << " `MXNET_DISABLE_MKLDNN_QFC_FUSE_ALL` are not set to true (default is false)";
       }
-      support_channelwise_scale = support_channelwise_scale && channel_wise;
+      support_channelwise_scale = support_channelwise_scale && channel_wise_runtime_;
 
       if (support_channelwise_scale) {
         MSHADOW_REAL_TYPE_SWITCH(cached_weight_.dtype(), DType, {
@@ -329,14 +329,16 @@ void SgMKLDNNFCOp::Forward(const OpContext &ctx,
                               has_bias ? &bias_md : nullptr,
                               1, data_scale_, weight_scales_, false);
     } else {
-      cached_weight_ = NDArray(fwd_->fwd_pd.weights_desc());
-      auto cached_weight_mem = cached_weight_.GetMKLDNNData();
-      auto def_weight_mem = weight.GetMKLDNNData();
-      std::unordered_map<int, mkldnn::memory> args(
-        {{MKLDNN_ARG_FROM, *def_weight_mem},
-        {MKLDNN_ARG_TO, *cached_weight_mem}});
-      MKLDNNStream::Get()->RegisterPrimArgs(
-        mkldnn::reorder(*def_weight_mem, *cached_weight_mem), args);
+      const auto def_weight_mem = weight.GetMKLDNNData();
+      if (def_weight_mem->get_desc() != fwd_->fwd_pd.weights_desc()) {
+        cached_weight_ = NDArray(fwd_->fwd_pd.weights_desc());
+        auto cached_weight_mem = cached_weight_.GetMKLDNNData();
+        std::unordered_map<int, mkldnn::memory> args(
+          {{MKLDNN_ARG_FROM, *def_weight_mem},
+          {MKLDNN_ARG_TO, *cached_weight_mem}});
+        MKLDNNStream::Get()->RegisterPrimArgs(
+          mkldnn::reorder(*def_weight_mem, *cached_weight_mem), args);
+      }
     }
 
     args_[MKLDNN_ARG_SRC] = *data.GetMKLDNNData();
