@@ -68,6 +68,7 @@ class SgMKLDNNFCOp {
   MKLDNNFCFullParam full_param_;
   mkldnn_args_map_t args_;
   std::shared_ptr<MKLDNNFullyConnectedForward> fwd_;
+  std::shared_ptr<mkldnn::memory> cached_data_mem_;
   std::shared_ptr<mkldnn::memory> cached_out_mem_;
   NDArray cached_weight_;
   NDArray cached_bias_;
@@ -83,6 +84,8 @@ class SgMKLDNNFCOp {
   float cached_max_output_;
   float data_scale_{0.0f};
   std::vector<float> weight_scales_;
+  size_t total_num_inputs_;
+  size_t total_num_outputs_;
 };
 
 static inline void MKLDNNFCFlattenData(const FullyConnectedParam &param,
@@ -113,9 +116,7 @@ void SgMKLDNNFCOp::Forward(const OpContext &ctx,
   auto &default_param = full_param_.default_param;
   bool has_bias = !default_param.no_bias;
   size_t base_num_inputs = has_bias ? 3 : 2;
-  size_t total_num_inputs = base_num_inputs;
   size_t base_num_outputs = 1;
-  size_t total_num_outputs = base_num_outputs;
 
   float min_data = 0.0f;
   float max_data = 0.0f;
@@ -124,16 +125,25 @@ void SgMKLDNNFCOp::Forward(const OpContext &ctx,
   float min_bias = 0.0f;
   float max_bias = 0.0f;
 
-  if (!initialized_ && mkldnn_param.channel_wise_quantize.has_value() &&
-      mkldnn_param.channel_wise_quantize) {
-    channel_wise_runtime_ = true;
+  if (!initialized_) {
+    if (mkldnn_param.channel_wise_quantize.has_value() &&
+        mkldnn_param.channel_wise_quantize) {
+      channel_wise_runtime_ = true;
+    }
+
+    total_num_inputs_ = base_num_inputs;
+    total_num_outputs_ = base_num_outputs;
+    if (mkldnn_param.quantized) {
+      total_num_inputs_ = channel_wise_runtime_ ? (base_num_inputs + 2) : (base_num_inputs * 3);
+      total_num_outputs_ =
+        mkldnn_param.enable_float_output ? base_num_outputs : (base_num_outputs * 3);
+    }
   }
+  CHECK_EQ(in_data.size(), total_num_inputs_);
+  CHECK_EQ(out_data.size(), total_num_outputs_);
 
   if (mkldnn_param.quantized) {
-    if (channel_wise_runtime_) {
-      total_num_inputs = base_num_inputs + 2;
-    } else {
-      total_num_inputs = base_num_inputs * 3;
+    if (!channel_wise_runtime_) {
       min_weight = in_data[base_num_inputs + quantized_fullc::kWeightMin].data().dptr<float>()[0];
       max_weight = in_data[base_num_inputs + quantized_fullc::kWeightMax].data().dptr<float>()[0];
       if (has_bias) {
@@ -143,12 +153,7 @@ void SgMKLDNNFCOp::Forward(const OpContext &ctx,
     }
     min_data = in_data[base_num_inputs + quantized_fullc::kDataMin].data().dptr<float>()[0];
     max_data = in_data[base_num_inputs + quantized_fullc::kDataMax].data().dptr<float>()[0];
-    if (!mkldnn_param.enable_float_output) {
-      total_num_outputs = base_num_outputs * 3;
-    }
   }
-  CHECK_EQ(in_data.size(), total_num_inputs);
-  CHECK_EQ(out_data.size(), total_num_outputs);
 
   NDArray data = in_data[fullc::kData];
   NDArray weight = in_data[fullc::kWeight];
@@ -187,9 +192,9 @@ void SgMKLDNNFCOp::Forward(const OpContext &ctx,
     } else {
       cached_bias_ = NDArray();
     }
+    const auto engine = CpuEngine::Get()->get_engine();
 
     // create cached out_md
-    const mxnet::TShape ishape = data.shape();
     const mxnet::TShape oshape = output.shape();
     mkldnn::memory::dims out_dims(2);
     if (oshape.ndim() == 2) {
@@ -206,7 +211,7 @@ void SgMKLDNNFCOp::Forward(const OpContext &ctx,
     }
     mkldnn::memory::desc out_md = mkldnn::memory::desc(out_dims, get_mkldnn_type(output.dtype()),
       static_cast<mkldnn::memory::format_tag>(GetDefaultFormat(2)));
-    cached_out_mem_ = std::make_shared<mkldnn::memory>(out_md, CpuEngine::Get()->get_engine());
+    cached_out_mem_ = std::make_shared<mkldnn::memory>(out_md, engine);
 
     bool support_channelwise_scale = false;
     if (mkldnn_param.quantized) {
@@ -341,7 +346,13 @@ void SgMKLDNNFCOp::Forward(const OpContext &ctx,
       }
     }
 
-    args_[MKLDNN_ARG_SRC] = *data.GetMKLDNNData();
+    if (data.IsMKLDNNData()) {
+      data = data.Reorder2Default();
+    }
+    const auto data_mem = data.GetMKLDNNData();
+    cached_data_mem_ = std::make_shared<mkldnn::memory>(data_mem->get_desc(), engine);
+
+    args_[MKLDNN_ARG_SRC] = *cached_data_mem_;
     args_[MKLDNN_ARG_WEIGHTS] = *cached_weight_.GetMKLDNNData();
     if (has_bias)
       args_[MKLDNN_ARG_BIAS] = *cached_bias_.GetMKLDNNData();
@@ -349,12 +360,12 @@ void SgMKLDNNFCOp::Forward(const OpContext &ctx,
     initialized_ = true;
   }
 
-  auto data_mem = data.GetMKLDNNDataReorder(fwd_->fwd_pd.src_desc());
+  MSHADOW_TYPE_SWITCH(data.dtype(), DType, {
+    cached_data_mem_->set_data_handle(reinterpret_cast<void *>(data.data().dptr<DType>()));
+  });
   MSHADOW_TYPE_SWITCH(output.dtype(), DType, {
     cached_out_mem_->set_data_handle(reinterpret_cast<void *>(output.data().dptr<DType>()));
   });
-  args_[MKLDNN_ARG_SRC] = *data_mem;
-  args_[MKLDNN_ARG_DST] = *cached_out_mem_;
   MKLDNNStream::Get()->RegisterPrimArgs(fwd_->GetFwd(), args_);
   MKLDNNStream::Get()->Submit();
 
