@@ -30,6 +30,7 @@ from mxnet import context
 from mxnet.gluon.data.dataset import Dataset
 from mxnet.gluon.data.dataset import ArrayDataset
 
+@unittest.skip("a")
 @with_seed()
 def test_array_dataset():
     X = np.random.uniform(size=(10, 20))
@@ -63,6 +64,7 @@ def prepare_record():
     return 'data/test.rec'
 
 
+@unittest.skip("a")
 @with_seed()
 def test_recordimage_dataset():
     recfile = prepare_record()
@@ -82,6 +84,7 @@ def _dataset_transform_first_fn(x):
     """Named transform function since lambda function cannot be pickled."""
     return x
 
+@unittest.skip("a")
 @with_seed()
 def test_recordimage_dataset_with_data_loader_multiworker():
     recfile = prepare_record()
@@ -108,6 +111,7 @@ def test_recordimage_dataset_with_data_loader_multiworker():
         assert x.shape[0] == 1 and x.shape[3] == 3
         assert y.asscalar() == i
 
+#@unittest.skip("a")
 @with_seed()
 def test_sampler():
     seq_sampler = gluon.data.SequentialSampler(10)
@@ -121,6 +125,7 @@ def test_sampler():
     rand_batch_keep = gluon.data.BatchSampler(rand_sampler, 3, 'keep')
     assert sorted(sum(list(rand_batch_keep), [])) == list(range(10))
 
+#@unittest.skip("a")
 @with_seed()
 def test_datasets():
     assert len(gluon.data.vision.MNIST(root='data/mnist')) == 60000
@@ -133,6 +138,7 @@ def test_datasets():
     assert len(gluon.data.vision.CIFAR100(root='data/cifar100', fine_label=True)) == 50000
     assert len(gluon.data.vision.CIFAR100(root='data/cifar100', train=False)) == 10000
 
+#@unittest.skip("a")
 @with_seed()
 def test_image_folder_dataset():
     prepare_record()
@@ -140,6 +146,7 @@ def test_image_folder_dataset():
     assert dataset.synsets == ['test_images']
     assert len(dataset.items) == 16
 
+#################
 @with_seed()
 def test_list_dataset():
     for num_worker in range(0, 3):
@@ -154,6 +161,7 @@ class Dataset(gluon.data.Dataset):
     def __getitem__(self, key):
         return mx.nd.full((10,), key)
 
+#################
 @with_seed()
 def test_multi_worker():
     data = Dataset()
@@ -344,13 +352,6 @@ def test_dataset_take():
     assert total == expected_total
 
 def test_dataloader_scope():
-    """
-    Bug: Gluon DataLoader terminates the process pool early while
-    _MultiWorkerIter is operating on the pool.
-
-    Tests that DataLoader is not garbage collected while the iterator is
-    in use.
-    """
     args = {'num_workers': 1, 'batch_size': 2}
     dataset = nd.ones(5)
     iterator = iter(DataLoader(
